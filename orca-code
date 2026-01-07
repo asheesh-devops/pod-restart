@@ -1,0 +1,107 @@
+stage('Docker') {
+    when {
+        beforeAgent true
+        expression { env.ONLY_MANIFESTS != "true" }
+        environment name: 'CHANGE_ID', value: ''
+        anyOf {
+            branch 'development'; branch 'staging'; branch 'qat'; branch 'master'
+        }
+    }
+    steps {
+        container('docker') {
+            dir('./source') {
+                script {
+                    withCredentials([
+                        [$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AWS_Credentials', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
+                    ]) {
+                        // Configure AWS and ECR
+                        env.AWS_DEFAULT_REGION = 'us-west-2'
+                        sh "aws configure set default.region ${env.AWS_DEFAULT_REGION}"
+                        sh "aws ecr create-repository --repository-name service_images/${env.PROJECT_NAME} || true"
+                        sh "aws ecr put-lifecycle-policy --repository-name service_images/${env.PROJECT_NAME} --lifecycle-policy-text '{\"rules\":[{\"rulePriority\":1,\"description\":\"Remove dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":2,\"description\":\"Remove tg-dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":3,\"description\":\"Remove stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":4,\"description\":\"Remove tg-stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":5,\"description\":\"Remove prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":6,\"description\":\"Remove tg-prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":7,\"description\":\"Remove qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":8,\"description\":\"Remove tg-qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":9,\"description\":\"Remove release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":10,\"description\":\"Remove tg-release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":11,\"description\":\"Remove untagged images - KEEP NONE\",\"selection\":{\"tagStatus\":\"untagged\",\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":12,\"description\":\"Remove pre-prod images - KEEP ONLY 1 DAY\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"pre-prod\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}}]}' || true"
+                        sh "aws ecr set-repository-policy --repository-name service_images/${env.PROJECT_NAME} --policy-text '{ \"Version\" : \"2008-10-17\",\"Statement\" : [ { \"Sid\" : \"Allow Prod EKS\",\"Effect\" : \"Allow\",\"Principal\" : { \"AWS\" : \"arn:aws:iam::035592488042:root\" }, \"Action\" : [ \"ecr:GetDownloadUrlForLayer\", \"ecr:BatchGetImage\", \"ecr:BatchCheckLayerAvailability\" ] } ] }'"
+                        sh "aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 035592488042.dkr.ecr.us-west-2.amazonaws.com"
+                        
+                        // Determine image tag prefix and Orca project key
+                        def imageTag = params.DeployTarget ? "tg-${env.DOCKER_BUILD_IMAGE_TAG}" : "${env.DOCKER_BUILD_IMAGE_TAG}"
+                        def orcaProjectKey = getOrcaProjectKey(env.BRANCH_NAME)
+                        
+                        // Log deployment type
+                        if (params.DeployTarget) {
+                            echo "Target specific deployment selected. Creating image with tg- prefix."
+                        } else {
+                            echo "Regular deployment. Target pods will not be deployed."
+                        }
+                        
+                        // Build Docker image
+                        def serviceImage = docker.build(
+                            "service_images/${env.PROJECT_NAME}:${imageTag}",
+                            "--network=host --label environment=${env.ENVIRONMENT} --label service=${env.PROJECT_NAME} --label jenkins_build_number='${env.BUILD_NUMBER}' --label git_commit=${env.GIT_COMMIT} --build-arg project_name='${env.PROJECT_NAME}' --build-arg branch_name='${env.BRANCH_NAME}' ."
+                        )
+                        
+                        // Run Orca security scan
+                        if (orcaProjectKey) {
+                            echo "Running Orca security scan for project: ${orcaProjectKey}"
+                            sh """
+                                orca-cli image scan \
+                                    --project-key ${orcaProjectKey} \
+                                    --api-token ${ORCA_API_TOKEN} \
+                                    service_images/${env.PROJECT_NAME}:${imageTag}
+                            """
+                        }
+                        
+                        // Push image to ECR
+                        docker.withRegistry("https://${env.ECR_HOST}") {
+                            serviceImage.push()
+                            sh "docker rmi -f ${serviceImage.id} ${env.ECR_HOST}/${serviceImage.id}"
+                        }
+                        
+                        // Set environment variable for downstream stages
+                        env.PROJECT_DOCKER_IMAGE = "${env.ECR_HOST}/service_images/${env.PROJECT_NAME}:${imageTag}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ... rest of your stages ...
+
+// At the END of your file, add this with your other helper functions:
+def getOrcaProjectKey(branchName) {
+    def projectKeyMap = [
+        'development': 'development',
+        'staging': 'staging',
+        'qat': 'qat',
+        'master': 'production'
+    ]
+    return projectKeyMap[branchName]
+}
+
+// Your existing helper functions
+def getChangeLogMsgs(currentBuild) {
+    // ... existing code
+}
+
+def define_environment(branch_environments, other_branch_environment) {
+    // ... existing code
+}
+
+// ... rest of your helper functions
+
+return this
+```
+
+### **Where to Place It Exactly:**
+
+Looking at your original pipeline, place `getOrcaProjectKey()` **right before** the `return this` statement at the very end of the file, alongside your other helper functions like:
+- `definecheckout_to()`
+- `define_kubeconfig_toggle()`
+- `define_eks_deployment_namespace_toggle()`
+
+## ✅ Final Checklist:
+```
+□ Replace the stage('Docker') section (WITHOUT the helper function)
+□ Add getOrcaProjectKey() function at the END of file (before "return this")
+□ Create Orca projects: qat and production
+□ Commit and test
