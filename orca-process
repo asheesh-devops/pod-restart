@@ -1,0 +1,48 @@
+✅ What You Need to Do:
+1. Create Missing Orca Projects (In Orca UI)
+You already have:
+
+✅ klearnow (development) - project key: development
+✅ klearnow_stage (staging) - project key: staging
+
+You need to create:
+
+❌ QAT project - project key: qat
+❌ Production project - project key: production
+
+How to create them:
+
+Go to Orca UI → AppSec Management → Projects
+Click "Create New" button
+Create QAT project:
+
+Project Name: klearnow_qat (or whatever you prefer)
+Project Key: qat (MUST be exactly "qat")
+
+
+Create Production project:
+
+Project Name: klearnow_prod (or whatever you prefer)
+Project Key: production (MUST be exactly "production")
+
+
+
+2. Update Your Jenkinsfile (In Your Git Repo)
+Replace the entire stage('Docker') section in your Jenkinsfile with the optimized code I provided.
+
+❌ What You DON'T Need to Do:
+
+❌ No Jenkins configuration changes needed
+❌ No new Jenkins credentials (you already have ORCA_API_TOKEN)
+❌ No Jenkins plugins to install
+❌ No environment variables to add
+
+
+📋 Quick Checklist:
+□ Create Orca project: klearnow_qat (project key: qat)
+□ Create Orca project: klearnow_prod (project key: production)
+□ Update Jenkinsfile with optimized Docker stage code
+□ Commit and push changes to Git
+□ Trigger builds on staging/qat/master branches
+□ Check Orca UI for scan results (5-15 minutes after build)
+That's it! The ORCA_API_TOKEN credential already exists in your Jenkins (you're using it for development scans), so everything else is ready to go. 🚀
