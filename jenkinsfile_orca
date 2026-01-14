@@ -1,0 +1,15 @@
+#!/usr/bin/env groovy
+
+@Library('kxlib@development') _
+
+properties([
+    parameters([
+        booleanParam(
+            name: 'DeployTarget',
+            defaultValue: false,
+            description: 'Enable target-specific deployment (adds tg- prefix)'
+        )
+    ])
+])
+
+kxGlobalPipeline([:])
