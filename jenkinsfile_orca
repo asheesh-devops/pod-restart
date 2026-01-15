@@ -1,15 +1,25 @@
 #!/usr/bin/env groovy
-
-@Library('kxlib@development') _
+@Library('kxlib@ashishvorca') _
 
 properties([
     parameters([
+        choice(
+            name: 'TARGET_ENVIRONMENT',
+            choices: ['Auto (based on branch)', 'development', 'staging', 'qat', 'production'],
+            description: 'Select target environment to deploy to. "Auto" will use the branch name to determine the environment.'
+        ),
         booleanParam(
             name: 'DeployTarget',
             defaultValue: false,
-            description: 'Enable target-specific deployment (adds tg- prefix)'
+            description: 'Enable target-specific deployment (adds tg- prefix to images)'
+        ),
+        booleanParam(
+            name: 'SKIP_ORCA_SCAN',
+            defaultValue: false,
+            description: 'Skip Orca security scanning (not recommended for production)'
         )
     ])
 ])
 
-kxGlobalPipeline([:])
+// Call the main pipeline
+dockerPipeline([:])
