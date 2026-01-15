@@ -1,3 +1,4 @@
+
 #!/usr/bin/env groovy
 @Library('kxlib@ashishvorca') _
 
@@ -21,5 +22,4 @@ properties([
     ])
 ])
 
-// Call the main pipeline
-dockerPipeline([:])
+orcascanstageqatprod([:])
