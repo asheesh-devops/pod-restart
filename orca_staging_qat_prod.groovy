@@ -7,16 +7,6 @@
  *
  *  Copyright (c) 2018 - 2018 KlearExpress Corporation.
  *  All Rights Reserved.
- *
- * NOTICE:  All information contained herein is, and remains
- * the property of KlearExpress Corporation and its suppliers,
- * if any.  The intellectual and technical concepts contained
- * herein are proprietary to KlearExpress Corporation
- * and its suppliers and may be covered by U.S. and Foreign Patents,
- * patents in process, and are protected by trade secret or copyright law.
- * Dissemination of this information or reproduction of this material
- * is strictly forbidden unless prior written permission is obtained
- * from KlearExpress Corporation.
  */
 
 final kxlib = library('kxlib@development')
@@ -93,6 +83,28 @@ spec:
         yaml podYaml  // Pass the dynamically generated YAML here
       }
       }
+    
+    // ========================================
+    // PARAMETERS - Environment Selection
+    // ========================================
+    parameters {
+      choice(
+        name: 'TARGET_ENVIRONMENT',
+        choices: ['Auto (based on branch)', 'development', 'staging', 'qat', 'production'],
+        description: 'Select target environment to deploy to. "Auto" will use the branch name to determine the environment.'
+      )
+      booleanParam(
+        name: 'DeployTarget',
+        defaultValue: false,
+        description: 'Enable target-specific deployment (adds tg- prefix to images)'
+      )
+      booleanParam(
+        name: 'SKIP_ORCA_SCAN',
+        defaultValue: false,
+        description: 'Skip Orca security scanning (not recommended)'
+      )
+    }
+    
     options {
       buildDiscarder(logRotator(numToKeepStr: '5', daysToKeepStr: '10'))
       disableConcurrentBuilds abortPrevious: true
@@ -137,6 +149,52 @@ spec:
 	    go 'go-1.18'
     }
     stages {
+      stage('Environment Selection') {
+        steps {
+          script {
+            // Display selected environment
+            echo """
+╔════════════════════════════════════════════════════════════════╗
+║              BUILD CONFIGURATION                              ║
+╠════════════════════════════════════════════════════════════════╣
+║  Branch:              ${env.BRANCH_NAME.padRight(40)}║
+║  Selected Target:     ${params.TARGET_ENVIRONMENT.padRight(40)}║
+║  Deploy Target Mode:  ${params.DeployTarget.toString().padRight(40)}║
+║  Skip Orca Scan:      ${params.SKIP_ORCA_SCAN.toString().padRight(40)}║
+╠════════════════════════════════════════════════════════════════╣
+║  Effective Environment: ${env.ENVIRONMENT.padRight(36)}║
+╚════════════════════════════════════════════════════════════════╝
+"""
+            
+            // Override environment if user selected specific target
+            if (params.TARGET_ENVIRONMENT != 'Auto (based on branch)') {
+              echo "⚠️  OVERRIDE: User selected environment '${params.TARGET_ENVIRONMENT}' instead of branch default '${env.ENVIRONMENT}'"
+              env.ENVIRONMENT = params.TARGET_ENVIRONMENT
+              
+              // Update related environment variables based on override
+              def targetBranch = mapEnvironmentToBranch(params.TARGET_ENVIRONMENT)
+              echo "   Mapping to branch configuration: ${targetBranch}"
+              
+              // Recalculate environment-specific variables
+              env.DOCKER_BUILD_IMAGE_TAG = define_docker_build_image_tag_for_env(params.TARGET_ENVIRONMENT)
+              env.AWS_SSL_ARN = define_aws_ssl_arn_for_env(params.TARGET_ENVIRONMENT, branch_environments)
+              env.XEKS_DEPLOYMENT_NAMESPACE = define_eks_deployment_namespace_for_env(params.TARGET_ENVIRONMENT, branch_environments)
+              env.XKUBECONFIG = define_kubeconfig_for_env(params.TARGET_ENVIRONMENT, branch_environments)
+              
+              echo """
+╔════════════════════════════════════════════════════════════════╗
+║              ENVIRONMENT OVERRIDE APPLIED                     ║
+╠════════════════════════════════════════════════════════════════╣
+║  New Environment:     ${env.ENVIRONMENT.padRight(40)}║
+║  Image Tag:           ${env.DOCKER_BUILD_IMAGE_TAG.padRight(40)}║
+║  EKS Namespace:       ${env.XEKS_DEPLOYMENT_NAMESPACE.padRight(40)}║
+╚════════════════════════════════════════════════════════════════╝
+"""
+            }
+          }
+        }
+      }
+      
       stage('Bootstrap') {
         when {
           beforeAgent true
@@ -175,7 +233,6 @@ spec:
                 env.GIT_COMMIT = readFile('GIT_COMMIT')
                 env.PROJECT_DOCKER_IMAGE = ""
                 //////////////////DORA/////////////////////////
-                //env.build_start = sh(returnStdout: true, script: 'date').trim()
 			    	    env.build_start = sh(returnStdout: true, script: 'TZ=Asia/Kolkata date "+%Y-%m-%d %H:%M:%S"').trim()
                 echo "${env.build_start}"
                 ////////////////////////////////////////////////
@@ -305,18 +362,24 @@ spec:
                   // ========================================
                   // ORCA SECURITY SCAN - ALL BRANCHES
                   // ========================================
-                  echo "Initiating Orca Security Scan for ${env.BRANCH_NAME} branch..."
-                  def scanResults = executeOrcaScan(
-                    fullImageName,
-                    env.BRANCH_NAME,
-                    env.ORCA_API_TOKEN
-                  )
-                  
-                  // Store scan results in environment for later use
-                  env.ORCA_SCAN_SUCCESS = scanResults.success.toString()
-                  env.ORCA_SCAN_CRITICAL = scanResults.criticalCount.toString()
-                  env.ORCA_SCAN_HIGH = scanResults.highCount.toString()
-                  env.ORCA_PROJECT = scanResults.project
+                  if (!params.SKIP_ORCA_SCAN) {
+                    echo "Initiating Orca Security Scan for ${env.ENVIRONMENT} environment..."
+                    def scanResults = executeOrcaScan(
+                      fullImageName,
+                      env.ENVIRONMENT,  // Use effective environment instead of branch
+                      env.ORCA_API_TOKEN
+                    )
+                    
+                    // Store scan results in environment for later use
+                    env.ORCA_SCAN_SUCCESS = scanResults.success.toString()
+                    env.ORCA_SCAN_CRITICAL = scanResults.criticalCount.toString()
+                    env.ORCA_SCAN_HIGH = scanResults.highCount.toString()
+                    env.ORCA_PROJECT = scanResults.project
+                  } else {
+                    echo "⚠️  ORCA SCAN SKIPPED - User selected to skip security scanning"
+                    env.ORCA_SCAN_SUCCESS = "SKIPPED"
+                    env.ORCA_PROJECT = "N/A"
+                  }
                   
                   // Push to ECR
                   echo "Pushing image to ECR..."
@@ -332,8 +395,9 @@ spec:
 ║              DOCKER BUILD & SCAN COMPLETED                    ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Image:        ${env.PROJECT_DOCKER_IMAGE.take(48).padRight(48)}║
+║  Environment:  ${env.ENVIRONMENT.padRight(48)}║
 ║  Orca Project: ${env.ORCA_PROJECT.padRight(48)}║
-║  Scan Status:  ${(scanResults.success ? 'SUCCESS' : 'FAILED').padRight(48)}║
+║  Scan Status:  ${env.ORCA_SCAN_SUCCESS.padRight(48)}║
 ╚════════════════════════════════════════════════════════════════╝
 """
                 }
@@ -346,8 +410,9 @@ spec:
         when {
           beforeAgent true
           environment name: 'CHANGE_ID', value: ''
-          anyOf {
-            branch 'development'; branch 'staging'; branch 'qat'
+          expression {
+            // Deploy to kubectl for dev, staging, qat (not production)
+            return env.ENVIRONMENT in ['development', 'staging', 'qat']
           }
         }
         environment {
@@ -377,7 +442,7 @@ spec:
                         }
                         echo "Kubernetes manifest file"
                         sh "cat kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                        echo "Deploying to Kubernetes Cluster"
+                        echo "Deploying to Kubernetes Cluster - ${env.ENVIRONMENT}"
                         sh "kubectl --kubeconfig=./${env.KUBECONFIG} apply -f kubernetesfiles/${env.PROJECT_NAME}.yaml"
                         push_files_to_s3("${env.PROJECT_NAME}.yaml", "${env.ENVIRONMENT}")
                       } else if (!k8_manifest_map.containsKey('skip') || k8_manifest_map.skip != "true") {
@@ -396,8 +461,9 @@ spec:
         when {
           beforeAgent true
           environment name: 'CHANGE_ID', value: ''
-          anyOf {
-            branch 'master';
+          expression {
+            // Deploy to spinnaker for production
+            return env.ENVIRONMENT == 'production'
           }
         }
         environment {
@@ -489,13 +555,19 @@ spec:
     }
     post {
       always {
-        /* Use slackNotifier.groovy from shared library and provide current build result as parameter */
         script{
           env.CHANGED_LOG = getChangeLogMsgs(currentBuild)
           def result = "${currentBuild.currentResult}"
-          // slackNotifier {
-          //   buildResult = result
-          // }
+          
+          // Add environment info to notification
+          def buildSummary = """
+Build #${env.BUILD_NUMBER} - ${result}
+Environment: ${env.ENVIRONMENT}
+Branch: ${env.BRANCH_NAME}
+Orca Scan: ${env.ORCA_SCAN_SUCCESS ?: 'N/A'}
+"""
+          echo buildSummary
+          
           teamsNotifier {
             buildResult = result
           }
@@ -507,6 +579,10 @@ spec:
     }
   }
 }
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 
 def getChangeLogMsgs(currentBuild) {
   passedBuilds = []
@@ -631,7 +707,7 @@ def define_kubeconfig_toggle(environments_info, environment_binding) {
   echo "TOGGLING KUBECONFIG FOR ${environment_binding} --> ${environments_info[environment_binding]['EKS_KUBECONFIG']}"
   return "${environments_info[environment_binding]['EKS_KUBECONFIG']}"
 }
-// function for backward merge
+
 def definecheckout_to() {
     def branchName = "${env.BRANCH_NAME}"
     if (branchName == "master") {
@@ -643,16 +719,91 @@ def definecheckout_to() {
 }
 
 // ============================================================================
+// ENVIRONMENT OVERRIDE HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Maps environment name to corresponding branch name
+ */
+def mapEnvironmentToBranch(String environment) {
+    switch(environment) {
+        case 'production':
+            return 'master'
+        case 'staging':
+            return 'staging'
+        case 'qat':
+            return 'qat'
+        case 'development':
+            return 'development'
+        default:
+            return 'development'
+    }
+}
+
+/**
+ * Define Docker image tag based on environment override
+ */
+def define_docker_build_image_tag_for_env(String environment) {
+    def prefix = ''
+    switch(environment) {
+        case 'production':
+            prefix = 'prod-'
+            break
+        case 'staging':
+            prefix = 'stage-'
+            break
+        case 'qat':
+            prefix = 'qat-'
+            break
+        default:
+            prefix = 'dev-'
+    }
+    return "${prefix}${env.BUILD_NUMBER}"
+}
+
+/**
+ * Define AWS SSL ARN based on environment override
+ */
+def define_aws_ssl_arn_for_env(String environment, Map branch_environments) {
+    def targetBranch = mapEnvironmentToBranch(environment)
+    if (branch_environments.containsKey(targetBranch)) {
+        return "${branch_environments[targetBranch]['SSL_ARN']}"
+    }
+    return "${branch_environments['development']['SSL_ARN']}"
+}
+
+/**
+ * Define EKS namespace based on environment override
+ */
+def define_eks_deployment_namespace_for_env(String environment, Map branch_environments) {
+    def targetBranch = mapEnvironmentToBranch(environment)
+    if (branch_environments.containsKey(targetBranch)) {
+        return "${branch_environments[targetBranch]['EKS_NAMESPACE']}"
+    }
+    return "${branch_environments['development']['EKS_NAMESPACE']}"
+}
+
+/**
+ * Define kubeconfig based on environment override
+ */
+def define_kubeconfig_for_env(String environment, Map branch_environments) {
+    def targetBranch = mapEnvironmentToBranch(environment)
+    if (branch_environments.containsKey(targetBranch)) {
+        return "${branch_environments[targetBranch]['EKS_KUBECONFIG']}"
+    }
+    return "${branch_environments['development']['EKS_KUBECONFIG']}"
+}
+
+// ============================================================================
 // ORCA SECURITY SCANNING FUNCTIONS
 // ============================================================================
 
 /**
- * Determines the Orca Security project based on branch name
- * Maps branches to their corresponding Orca projects
+ * Determines the Orca Security project based on environment name
  */
-def getOrcaProjectForBranch(String branchName) {
-    switch(branchName) {
-        case 'master':
+def getOrcaProjectForEnvironment(String environment) {
+    switch(environment) {
+        case 'production':
             return 'production'
         case 'staging':
             return 'staging'
@@ -661,20 +812,15 @@ def getOrcaProjectForBranch(String branchName) {
         case 'development':
             return 'development'
         default:
-            // All feature branches go to development project
             return 'development'
     }
 }
 
 /**
  * Executes Orca CLI security scan on a Docker image
- * @param imageName - Full image name (e.g., service_images/my-app:dev-123)
- * @param branchName - Branch being built
- * @param orcaToken - Orca API token
- * @return Map with scan results or error status
  */
-def executeOrcaScan(String imageName, String branchName, String orcaToken) {
-    def orcaProject = getOrcaProjectForBranch(branchName)
+def executeOrcaScan(String imageName, String environment, String orcaToken) {
+    def orcaProject = getOrcaProjectForEnvironment(environment)
     def scanResult = [
         success: false, 
         project: orcaProject, 
@@ -690,13 +836,13 @@ def executeOrcaScan(String imageName, String branchName, String orcaToken) {
 ╔════════════════════════════════════════════════════════════════╗
 ║              EXECUTING ORCA SECURITY SCAN                     ║
 ╠════════════════════════════════════════════════════════════════╣
-║  Image:    ${imageName.take(52).padRight(52)}║
-║  Branch:   ${branchName.padRight(52)}║
-║  Project:  ${orcaProject.padRight(52)}║
+║  Image:        ${imageName.take(48).padRight(48)}║
+║  Environment:  ${environment.padRight(48)}║
+║  Orca Project: ${orcaProject.padRight(48)}║
 ╚════════════════════════════════════════════════════════════════╝
 """
         
-        // Execute Orca scan with JSON output
+        // Execute Orca scan
         sh """
             orca-cli image scan \
                 --project-key ${orcaProject} \
@@ -735,10 +881,10 @@ def executeOrcaScan(String imageName, String branchName, String orcaToken) {
             // Archive scan results
             archiveArtifacts artifacts: 'orca-scan-results.json', allowEmptyArchive: true
             
-            // Optional: Fail build on critical vulnerabilities (configurable)
+            // Optional: Fail build on critical vulnerabilities
             if (scanResult.criticalCount > 0) {
                 echo "⚠️  WARNING: ${scanResult.criticalCount} critical vulnerabilities found!"
-                // Uncomment below to fail build on critical issues:
+                // Uncomment to fail build:
                 // error("Build failed due to ${scanResult.criticalCount} critical vulnerabilities")
             }
             
@@ -751,9 +897,6 @@ def executeOrcaScan(String imageName, String branchName, String orcaToken) {
         scanResult.success = false
         scanResult.message = "Scan failed: ${e.message}"
         echo "❌ Error during Orca scan: ${e.message}"
-        // Don't fail the build, just log the error
-        // Uncomment below to fail build on scan errors:
-        // throw e
     }
     
     return scanResult
