@@ -1,25 +1,15 @@
+/*************************************************************************
+ * Jenkinsfile - Orca Security Scan
+ * 
+ * This Jenkinsfile calls the Orca scan pipeline from kxlib
+ * 
+ * Usage:
+ *   - Place this file in your repository root as 'Jenkinsfile'
+ *   - Configure Jenkins job to use this Jenkinsfile
+ *   - The pipeline will scan Docker images and send results to Orca
+ */
 
-#!/usr/bin/env groovy
 @Library('kxlib@ashishvorca') _
 
-properties([
-    parameters([
-        choice(
-            name: 'TARGET_ENVIRONMENT',
-            choices: ['Auto (based on branch)', 'development', 'staging', 'qat', 'production'],
-            description: 'Select target environment to deploy to. "Auto" will use the branch name to determine the environment.'
-        ),
-        booleanParam(
-            name: 'DeployTarget',
-            defaultValue: false,
-            description: 'Enable target-specific deployment (adds tg- prefix to images)'
-        ),
-        booleanParam(
-            name: 'SKIP_ORCA_SCAN',
-            defaultValue: false,
-            description: 'Skip Orca security scanning (not recommended for production)'
-        )
-    ])
-])
-
+// Call the Orca scan pipeline
 orcascanstageqatprod([:])
