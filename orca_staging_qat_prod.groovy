@@ -1,5 +1,3 @@
-#!groovy
-
 /*************************************************************************
  *
  * KLEAREXPRESS CONFIDENTIAL
@@ -7,56 +5,36 @@
  *
  *  Copyright (c) 2018 - 2018 KlearExpress Corporation.
  *  All Rights Reserved.
+ *
+ * Orca Security Scan Pipeline - Staging Environment Only
+ * 
+ * This pipeline scans Docker images using Orca Security CLI and sends
+ * results to the Orca dashboard. It ONLY scans staging environment images.
+ * 
+ * Usage:
+ *   orcascanstageqatprod([
+ *     DOCKER_IMAGE: '035592488042.dkr.ecr.us-west-2.amazonaws.com/service_images/myapp:stage-123'
+ *   ])
  */
 
-final kxlib = library('kxlib@development')
+final kxlib = library('kxlib@ashishvorca')
 
 def call(Map pipelineParams) {
-  // execute this before anything else, including requesting any time on an agent
+  // Skip if triggered by branch indexing
   if (currentBuild.rawBuild.getCauses().toString().contains('BranchIndexingCause')) {
     print "INFO: Build skipped due to trigger being Branch Indexing"
     return
   }
-  def environments_info = [
-    blue: [NAME: 'BLUE', EKS_NAMESPACE: 'prod', EKS_KUBECONFIG: 'eks_kubeconfig_prod'],
-    green: [NAME: 'GREEN', EKS_NAMESPACE: 'stage', EKS_KUBECONFIG: 'eks_kubeconfig_stage']
-  ]
-  def branch_environments = [
-    development: [NAME: 'development', DOCKER_PREFIX_UNIQUEID: 'dev-', EKS_NAMESPACE: 'dev', SHARED_EKS_NAMESPACE: 'NA', EKS_KUBECONFIG: 'eks_kubeconfig_dev', SSL_ARN: 'arn:aws:acm:us-west-2:035592488042:certificate/7c26c813-9bda-4201-bfad-811aa3927a15', SPIN_PROMOTE_TO_ENV: 'staging'],
-    staging: [NAME: 'staging', DOCKER_PREFIX_UNIQUEID: 'stage-', EKS_NAMESPACE: '--KXENVTOGGLE--', SHARED_EKS_NAMESPACE: 'NA', EKS_KUBECONFIG: '--KXENVTOGGLE--', SSL_ARN: 'arn:aws:acm:us-east-1:035592488042:certificate/49647955-58f2-4a27-af10-07630f77414f', SPIN_PROMOTE_TO_ENV: 'master'],
-    qat: [NAME: 'qat', DOCKER_PREFIX_UNIQUEID: 'qat-', EKS_NAMESPACE: 'qat', SHARED_EKS_NAMESPACE: 'NA', EKS_KUBECONFIG: 'eks_kubeconfig_qat', SSL_ARN: 'arn:aws:acm:us-east-1:035592488042:certificate/84b52da1-b05b-4212-9e38-b830e6176a73', SPIN_PROMOTE_TO_ENV: 'master'],
-    master: [NAME: 'production', DOCKER_PREFIX_UNIQUEID: 'prod-', EKS_NAMESPACE: '--KXENVTOGGLE--', SHARED_EKS_NAMESPACE: 'NA', EKS_KUBECONFIG: '--KXENVTOGGLE--', SSL_ARN: 'arn:aws:acm:us-east-1:035592488042:certificate/8e1b1c20-b9af-43f6-85af-88929ef2e33a', SPIN_PROMOTE_TO_ENV: 'prodmaster'],
-    prodmaster: [NAME: 'production', DOCKER_PREFIX_UNIQUEID: 'prod-', EKS_NAMESPACE: '--KXENVTOGGLE--', SHARED_EKS_NAMESPACE: 'NA', EKS_KUBECONFIG: '--KXENVTOGGLE--', SSL_ARN: 'arn:aws:acm:us-east-1:035592488042:certificate/8e1b1c20-b9af-43f6-85af-88929ef2e33a']
-  ]
-  // DEFAULT CLUSTER FOR ALL BRANCH deployments
-  def other_branch_environment = "development"
 
   // Set node type based on branch
   def karpenter_node = (env.BRANCH_NAME == 'master') ? 'karpenter-prod' : 'karpenter'
 
-//////////////////////////////////////////////////////////////////////////////////
-  // Dynamically generate the YAML configuration with the correct node selector
+  // Pod configuration with docker container for Orca CLI
   def podYaml = """
 apiVersion: v1
 kind: Pod
 spec:
   containers:
-  - name: go
-    image: 035592488042.dkr.ecr.us-west-2.amazonaws.com/jenkins-agents:new-gospin
-    command:
-    - cat
-    tty: true
-    volumeMounts:
-    - mountPath: /var/lib/jenkins
-      name: persistent-storage
-  - name: ghcli
-    image: 035592488042.dkr.ecr.us-west-2.amazonaws.com/jenkins-agents:Ghcli
-    command:
-    - cat
-    tty: true
-    volumeMounts:
-    - mountPath: /var/lib/jenkins
-      name: persistent-storage
   - name: docker
     image: 035592488042.dkr.ecr.us-west-2.amazonaws.com/jenkins-agents:docker-orcacli
     tty: true
@@ -72,505 +50,263 @@ spec:
   securityContext:
     seLinuxOptions:
       type: spc_t
-  volumes:
-  - name: persistent-storage
-    persistentVolumeClaim:
-      claimName: efs-jenkins-claim
   """
+
   pipeline {
-        agent {
+    agent {
       kubernetes {
-        yaml podYaml  // Pass the dynamically generated YAML here
+        yaml podYaml
       }
-      }
+    }
     
-    // ========================================
-    // PARAMETERS - Environment Selection
-    // ========================================
     parameters {
-      choice(
-        name: 'TARGET_ENVIRONMENT',
-        choices: ['Auto (based on branch)', 'development', 'staging', 'qat', 'production'],
-        description: 'Select target environment to deploy to. "Auto" will use the branch name to determine the environment.'
+      string(
+        name: 'DOCKER_IMAGE',
+        defaultValue: '',
+        description: 'Full Docker image name with STAGING tag (e.g., 035592488042.dkr.ecr.us-west-2.amazonaws.com/service_images/myapp:stage-123)'
       )
       booleanParam(
-        name: 'DeployTarget',
+        name: 'SKIP_SCAN',
         defaultValue: false,
-        description: 'Enable target-specific deployment (adds tg- prefix to images)'
-      )
-      booleanParam(
-        name: 'SKIP_ORCA_SCAN',
-        defaultValue: false,
-        description: 'Skip Orca security scanning (not recommended)'
+        description: 'Skip Orca security scanning'
       )
     }
     
     options {
-      buildDiscarder(logRotator(numToKeepStr: '5', daysToKeepStr: '10'))
+      buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '30'))
       disableConcurrentBuilds abortPrevious: true
-      preserveStashes(buildCount: 5)
-      checkoutToSubdirectory('source')
-      // timeout(time: 40, unit: 'MINUTES') 
+      timeout(time: 30, unit: 'MINUTES')
     }
+    
     environment {
-      // KX Environment Configuration to manage with Blue/Green deployments
-      KX_ENVIRONMENT_CONFIGURATION_FILE = "kx_environment_configuration.groovy"
-      // KX Environment Configuration file path
-      KX_ENVIRONMENT_CONFIGURATION_JENKINS_LOAD_PATH = "${WORKSPACE}/.envvars/${KX_ENVIRONMENT_CONFIGURATION_FILE}"
-      // MANIFEST FILE TO RENDER - KUBECTL DEPLOY TEMPLATES
-      K8S_MANIFEST_JSON = 'k8sManifest.json'
-      // PROPERTIES FILE TO KEEP PROJECT VALUES SETUP
-      PROJECT_PROPERTIES_FILE = 'build.properties'
-      // The HOSTNAME of the AWS ECR repository.
-      ECR_HOST = '035592488042.dkr.ecr.us-west-2.amazonaws.com'
-      // ENVIRONMENT varible keeps the environment value for tagging labeling and conditions ex- [production]
-      ENVIRONMENT = define_environment(branch_environments, other_branch_environment)
-      // SPIN_PROMOTE_TO_ENV_NAME varible keeps the environment value for spinnaker next promoted env ex- [pre_production to production]
-      SPIN_PROMOTE_TO_ENV_NAME = define_next_promote_environment(branch_environments, other_branch_environment)
-      // AWS SSL Cert ARN which will be used by HTTPS Settings per Region ex- [aws certificate dev/prod]
-      SPIN_PROMOTE_AWS_SSL_ARN = define_next_promote_aws_ssl_arn(branch_environments, other_branch_environment)
-      // XSPIN_PROMOTE_TO_ENV_EKS_NAMESPACE varible keeps the environment namespace value for spinnaker next promoted env ex- [stage to pre-prod]
-      XSPIN_PROMOTE_TO_ENV_EKS_NAMESPACE = define_next_promote_environment_eks_namespace(branch_environments, other_branch_environment)
-      // DOCKER image tag which will be used to tag build images - branch unique build identifier ex- [prod]
-      DOCKER_BUILD_IMAGE_TAG = define_docker_build_image_tag(branch_environments, other_branch_environment)
-      // EKS Cluster Namespace where this builds need to be Deploy ex- [prod]
-      XEKS_DEPLOYMENT_NAMESPACE = define_eks_deployment_namespace(branch_environments, other_branch_environment)
-      // AWS SSL Cert ARN which will be used by HTTPS Settings per Region ex- [aws certificate dev/prod]
-      AWS_SSL_ARN = define_aws_ssl_arn(branch_environments, other_branch_environment)
-      // Kubeconfig of EKS Cluster to do operations on EKS.
-      XKUBECONFIG = define_kubeconfig(branch_environments, other_branch_environment)
-      // backward merge 
-      checkout = definecheckout_to()
-      // Orca Api Token
-      ORCA_API_TOKEN = credentials('orca-api-token') 
+      ORCA_API_TOKEN = credentials('orca-api-token')
+      AWS_DEFAULT_REGION = 'us-west-2'
     }
-    tools { 
-	    // go 'go-1.17.2'
-	    go 'go-1.18'
-    }
+    
     stages {
-      stage('Environment Selection') {
+      stage('Validate Parameters') {
         steps {
           script {
-            // Display selected environment
-            echo """
-╔════════════════════════════════════════════════════════════════╗
-║              BUILD CONFIGURATION                              ║
-╠════════════════════════════════════════════════════════════════╣
-║  Branch:              ${env.BRANCH_NAME.padRight(40)}║
-║  Selected Target:     ${params.TARGET_ENVIRONMENT.padRight(40)}║
-║  Deploy Target Mode:  ${params.DeployTarget.toString().padRight(40)}║
-║  Skip Orca Scan:      ${params.SKIP_ORCA_SCAN.toString().padRight(40)}║
-╠════════════════════════════════════════════════════════════════╣
-║  Effective Environment: ${env.ENVIRONMENT.padRight(36)}║
-╚════════════════════════════════════════════════════════════════╝
-"""
+            if (!params.DOCKER_IMAGE?.trim()) {
+              error("DOCKER_IMAGE parameter is required. Please provide the full Docker image name.")
+            }
             
-            // Override environment if user selected specific target
-            if (params.TARGET_ENVIRONMENT != 'Auto (based on branch)') {
-              echo "⚠️  OVERRIDE: User selected environment '${params.TARGET_ENVIRONMENT}' instead of branch default '${env.ENVIRONMENT}'"
-              env.ENVIRONMENT = params.TARGET_ENVIRONMENT
-              
-              // Update related environment variables based on override
-              def targetBranch = mapEnvironmentToBranch(params.TARGET_ENVIRONMENT)
-              echo "   Mapping to branch configuration: ${targetBranch}"
-              
-              // Recalculate environment-specific variables
-              env.DOCKER_BUILD_IMAGE_TAG = define_docker_build_image_tag_for_env(params.TARGET_ENVIRONMENT)
-              env.AWS_SSL_ARN = define_aws_ssl_arn_for_env(params.TARGET_ENVIRONMENT, branch_environments)
-              env.XEKS_DEPLOYMENT_NAMESPACE = define_eks_deployment_namespace_for_env(params.TARGET_ENVIRONMENT, branch_environments)
-              env.XKUBECONFIG = define_kubeconfig_for_env(params.TARGET_ENVIRONMENT, branch_environments)
-              
+            // Check if image is from STAGING environment ONLY
+            def isStaging = params.DOCKER_IMAGE.contains(':stage-') || 
+                           params.DOCKER_IMAGE.contains(':tg-stage-')
+            
+            if (!isStaging) {
               echo """
 ╔════════════════════════════════════════════════════════════════╗
-║              ENVIRONMENT OVERRIDE APPLIED                     ║
+║              SKIPPING SCAN - NOT STAGING IMAGE                ║
 ╠════════════════════════════════════════════════════════════════╣
-║  New Environment:     ${env.ENVIRONMENT.padRight(40)}║
-║  Image Tag:           ${env.DOCKER_BUILD_IMAGE_TAG.padRight(40)}║
-║  EKS Namespace:       ${env.XEKS_DEPLOYMENT_NAMESPACE.padRight(40)}║
+║  Image:         ${params.DOCKER_IMAGE.take(51).padRight(51)}║
+║  Reason:        Only STAGING images are scanned               ║
+║  Expected Tag:  Must contain ':stage-' or ':tg-stage-'       ║
 ╚════════════════════════════════════════════════════════════════╝
 """
+              currentBuild.result = 'SUCCESS'
+              currentBuild.description = "Skipped - Not a staging image"
+              return
             }
+            
+            echo """
+╔════════════════════════════════════════════════════════════════╗
+║              ORCA SCAN CONFIGURATION - STAGING ONLY           ║
+╠════════════════════════════════════════════════════════════════╣
+║  Docker Image:  ${params.DOCKER_IMAGE.take(52).padRight(52)}║
+║  Environment:   STAGING ✓                                     ║
+║  Orca Project:  staging                                       ║
+║  Skip Scan:     ${params.SKIP_SCAN.toString().padRight(52)}║
+╚════════════════════════════════════════════════════════════════╝
+"""
           }
         }
       }
       
-      stage('Bootstrap') {
+      stage('Orca Security Scan') {
         when {
-          beforeAgent true
-          anyOf {
-            branch 'development'; branch 'staging'; branch 'qat'; branch 'master'
-          }
-        }
-        steps {
-          container('go') {
-            dir('source') {
-              script {
-                if (!fileExists("${WORKSPACE}/source/${env.PROJECT_PROPERTIES_FILE}")) {
-                  currentBuild.result = 'ABORTED'
-                  error("ABORTED -> Stopping early…. Project Build Properties File Not found [ ${env.PROJECT_PROPERTIES_FILE} ]")
-                }
-                def props = readProperties file: "${env.PROJECT_PROPERTIES_FILE}"
-                env.PROJECT_NAME = props['projectName']
-                // Do NOT modify env.PROJECT_NAME
-                // Just build MANIFEST_FILE_NAME from it
-                if (params.DeployTarget) {
-                  echo "Target deployment enabled. Setting manifest and JSON names with tg- prefix."
-                  env.MANIFEST_FILE_NAME = env.PROJECT_NAME.startsWith("tg-") ? env.PROJECT_NAME : "tg-${env.PROJECT_NAME}"
-                } else {
-                  env.MANIFEST_FILE_NAME = env.PROJECT_NAME
-                }
-                if (props['projectPath']) {
-                  env.PROJECT_PATH = props['projectPath']
-                } else {
-                  env.PROJECT_PATH = '.'
-                }
-                env.BUILD_PROPERTIES_PROJECT_VERSION = props['projectVersion']
-                env.BUILD_PROPERTIES_ENVIRONMENT = props['environment']
-                env.REV_MERGE=props['reversemerge']
-                env.ONLY_MANIFESTS = props['onlyManifests']
-                sh 'git rev-parse HEAD | tr -d "\n" > GIT_COMMIT'
-                env.GIT_COMMIT = readFile('GIT_COMMIT')
-                env.PROJECT_DOCKER_IMAGE = ""
-                //////////////////DORA/////////////////////////
-			    	    env.build_start = sh(returnStdout: true, script: 'TZ=Asia/Kolkata date "+%Y-%m-%d %H:%M:%S"').trim()
-                echo "${env.build_start}"
-                ////////////////////////////////////////////////
-                echo "ENVIRONMENT -> ${env.ENVIRONMENT}"
-                echo "DOCKER_BUILD_IMAGE_TAG -> ${env.DOCKER_BUILD_IMAGE_TAG}"
-                echo "AWS_SSL_ARN -> ${env.AWS_SSL_ARN}"
-                env.ENVIRONMENT_BINDING = binding_environment("${env.ENVIRONMENT}")
-                echo "${env.BRANCH_NAME} BRANCH - ${env.ENVIRONMENT.toUpperCase()} ENVIRONMENT BINDING -> ${env.ENVIRONMENT_BINDING} FROM KX CONFIG FILE"
-                //                   ADD THE KXENVTOGGLE SETTINGS BELOW THIS COMMENT
-                //                          TOGGLING EKS NAMESPACE
-                if (env.XEKS_DEPLOYMENT_NAMESPACE.equals("--KXENVTOGGLE--")) {
-                  echo "TOGGLING - EKS_DEPLOYMENT_NAMESPACE [ ${XEKS_DEPLOYMENT_NAMESPACE} ]"
-                  if (!env.ENVIRONMENT_BINDING) {
-                    env.CHANGED_LOG = "## KX JENKINS ENVIRONMENT ENTRY MISSING FOR ${ env.ENVIRONMENT } ##"
-                    error("ABORTED -> Stopping early…. Environment Enteries Not Available For LEFT [ ${ env.ENVIRONMENT.toUpperCase() } ] in file ${KX_ENVIRONMENT_CONFIGURATION_FILE}")
-                  }
-                  env.EKS_DEPLOYMENT_NAMESPACE = define_eks_deployment_namespace_toggle(environments_info, env.ENVIRONMENT_BINDING)
-                } else {
-                  echo "SKIPPING TOGGLING - EKS_DEPLOYMENT_NAMESPACE [ ${XEKS_DEPLOYMENT_NAMESPACE} ]"
-                  env.EKS_DEPLOYMENT_NAMESPACE = env.XEKS_DEPLOYMENT_NAMESPACE
-                }
-                echo "EKS_DEPLOYMENT_NAMESPACE -> ${env.EKS_DEPLOYMENT_NAMESPACE}"
-                //                        END
-                //                          TOGGLING EKS SPIN NEXT NAMESPACE
-                if (env.XSPIN_PROMOTE_TO_ENV_EKS_NAMESPACE.equals("--KXENVTOGGLE--")) {
-                  echo "TOGGLING - SPIN_PROMOTE_TO_ENV_EKS_NAMESPACE [ ${XSPIN_PROMOTE_TO_ENV_EKS_NAMESPACE} ]"
-                  spin_next_environment_binding = binding_environment("${env.SPIN_PROMOTE_TO_ENV_NAME}")
-                  if (!spin_next_environment_binding) {
-                    env.CHANGED_LOG = "## KX JENKINS ENVIRONMENT ENTRY MISSING FOR ${ env.SPIN_PROMOTE_TO_ENV_NAME } ##"
-                    error("ABORTED -> Stopping early…. Environment Enteries Not Available For LEFT [ ${ env.SPIN_PROMOTE_TO_ENV_NAME.toUpperCase() } ] in file ${KX_ENVIRONMENT_CONFIGURATION_FILE}")
-                  }
-                  env.SPIN_PROMOTE_TO_ENV_EKS_NAMESPACE = define_eks_deployment_namespace_toggle(environments_info, spin_next_environment_binding)
-                } else {
-                  echo "SKIPPING TOGGLING - SPIN_PROMOTE_TO_ENV_EKS_NAMESPACE [ ${XSPIN_PROMOTE_TO_ENV_EKS_NAMESPACE} ]"
-                  env.SPIN_PROMOTE_TO_ENV_EKS_NAMESPACE = env.XSPIN_PROMOTE_TO_ENV_EKS_NAMESPACE
-                }
-                echo "SPIN_PROMOTE_TO_ENV_EKS_NAMESPACE -> ${env.SPIN_PROMOTE_TO_ENV_EKS_NAMESPACE}"
-                //                        END
-                //                        TOGGLING KUBECONFIG
-                if (env.XKUBECONFIG.equals("--KXENVTOGGLE--")) {
-                  echo "TOGGLING - KUBECONFIG [ ${XKUBECONFIG} ]"
-                  if (!env.ENVIRONMENT_BINDING) {
-                    env.CHANGED_LOG = "## KX JENKINS ENVIRONMENT ENTRY MISSING FOR ${ env.ENVIRONMENT } ##"
-                    error("ABORTED -> Stopping early…. Environment Enteries Not Available For LEFT [ ${ env.ENVIRONMENT.toUpperCase() } ] in file ${KX_ENVIRONMENT_CONFIGURATION_FILE}")
-                  }
-                  env.KUBECONFIG = define_kubeconfig_toggle(environments_info, env.ENVIRONMENT_BINDING)
-                } else {
-                  echo "SKIPPING TOGGLING - KUBECONFIG [ ${XKUBECONFIG} ]"
-                  env.KUBECONFIG = env.XKUBECONFIG
-                }
-                echo "KUBECONFIG -> ${env.KUBECONFIG}"
-                //                         END
-                if (!fileExists("${WORKSPACE}/source/${env.K8S_MANIFEST_JSON}")) {
-                  currentBuild.result = 'ABORTED'
-                  error("ABORTED -> Stopping early…. K8s manifests not found [ ${env.K8S_MANIFEST_JSON} ]")
-                }
-              }
-            }
-          }
-        }
-      }
-      stage ('Build') {
-        when {
-          anyOf {
-            branch 'development'; branch 'staging'; branch 'qat'; branch 'master';
-          }
-        }
-        steps {		
-          container('go') {	  
-            dir ('source') {
-              script {			
-                sh 'sh requirements.txt'
-                dir('src') {
-				          withCredentials([gitUsernamePassword(credentialsId: 'KNDevOps', gitToolName: 'git-tool')]) {
-				            sh 'go build -o main .'
-				          }
-                }
-			        }
-            }
-          }
-        }
-      }
-      stage('Docker') {
-        when {
-          beforeAgent true
-          expression {
-            env.ONLY_MANIFESTS != "true"
-          }
-          environment name: 'CHANGE_ID', value: ''
-          anyOf {
-            branch 'development'; branch 'staging'; branch 'qat'; branch 'master'
-          }
+          expression { params.SKIP_SCAN != true }
         }
         steps {
           container('docker') {
-            dir('./source') {
-              script {
-                withCredentials([
-                  [$class: 'AmazonWebServicesCredentialsBinding', 
-                   accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
-                   credentialsId: 'AWS_Credentials', 
-                   secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
-                ]) {
-                  env.AWS_DEFAULT_REGION = 'us-west-2'
-                  sh "aws configure set default.region ${env.AWS_DEFAULT_REGION}"
-                  sh "aws ecr create-repository --repository-name service_images/${env.PROJECT_NAME} || true"
-                  sh "aws ecr put-lifecycle-policy --repository-name service_images/${env.PROJECT_NAME} --lifecycle-policy-text '{\"rules\":[{\"rulePriority\":1,\"description\":\"Remove dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":2,\"description\":\"Remove tg-dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":3,\"description\":\"Remove stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":4,\"description\":\"Remove tg-stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":5,\"description\":\"Remove prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":6,\"description\":\"Remove tg-prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":7,\"description\":\"Remove qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":8,\"description\":\"Remove tg-qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":9,\"description\":\"Remove release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":10,\"description\":\"Remove tg-release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":11,\"description\":\"Remove untagged images - KEEP NONE\",\"selection\":{\"tagStatus\":\"untagged\",\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":12,\"description\":\"Remove pre-prod images - KEEP ONLY 1 DAY\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"pre-prod\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}}]}' || true"
-                  sh "aws ecr set-repository-policy --repository-name service_images/${env.PROJECT_NAME} --policy-text '{ \"Version\" : \"2008-10-17\",\"Statement\" : [ { \"Sid\" : \"Allow Prod EKS\",\"Effect\" : \"Allow\",\"Principal\" : { \"AWS\" : \"arn:aws:iam::035592488042:root\" }, \"Action\" : [ \"ecr:GetDownloadUrlForLayer\", \"ecr:BatchGetImage\", \"ecr:BatchCheckLayerAvailability\" ] } ] }'"
-                  sh(script: """aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 035592488042.dkr.ecr.us-west-2.amazonaws.com""")
-                  
-                  // Determine image tag and build
-                  def imageTag = params.DeployTarget ? "tg-${env.DOCKER_BUILD_IMAGE_TAG}" : env.DOCKER_BUILD_IMAGE_TAG
-                  def fullImageName = "service_images/${env.PROJECT_NAME}:${imageTag}"
-                  
-                  if (params.DeployTarget) {
-                    echo "Target specific deployment selected. Creating image with tg- prefix."
-                  } else {
-                    echo "Regular deployment. Creating standard image."
-                  }
-                  
-                  // Build Docker image
-                  def serviceImage = docker.build(
-                    fullImageName,
-                    "--network=host --label environment=${env.ENVIRONMENT} --label service=${env.PROJECT_NAME} --label jenkins_build_number='${env.BUILD_NUMBER}' --label git_commit=${env.GIT_COMMIT} --build-arg project_name='${env.PROJECT_NAME}' --build-arg branch_name='${env.BRANCH_NAME}' ."
-                  )
-                  
-                  // ========================================
-                  // ORCA SECURITY SCAN - ALL BRANCHES
-                  // ========================================
-                  if (!params.SKIP_ORCA_SCAN) {
-                    echo "Initiating Orca Security Scan for ${env.ENVIRONMENT} environment..."
-                    def scanResults = executeOrcaScan(
-                      fullImageName,
-                      env.ENVIRONMENT,  // Use effective environment instead of branch
-                      env.ORCA_API_TOKEN
-                    )
-                    
-                    // Store scan results in environment for later use
-                    env.ORCA_SCAN_SUCCESS = scanResults.success.toString()
-                    env.ORCA_SCAN_CRITICAL = scanResults.criticalCount.toString()
-                    env.ORCA_SCAN_HIGH = scanResults.highCount.toString()
-                    env.ORCA_PROJECT = scanResults.project
-                  } else {
-                    echo "⚠️  ORCA SCAN SKIPPED - User selected to skip security scanning"
-                    env.ORCA_SCAN_SUCCESS = "SKIPPED"
-                    env.ORCA_PROJECT = "N/A"
-                  }
-                  
-                  // Push to ECR
-                  echo "Pushing image to ECR..."
-                  docker.withRegistry("https://${env.ECR_HOST}") {
-                    serviceImage.push()
-                    sh "docker rmi -f ${serviceImage.id} ${env.ECR_HOST}/${serviceImage.id}"
-                  }
-                  
-                  env.PROJECT_DOCKER_IMAGE = "${env.ECR_HOST}/${fullImageName}"
-                  
+            script {
+              echo "Starting Orca security scan for staging environment..."
+              
+              // Authenticate with ECR BEFORE scanning
+              withCredentials([
+                [$class: 'AmazonWebServicesCredentialsBinding', 
+                 accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
+                 credentialsId: 'AWS_Credentials', 
+                 secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
+              ]) {
+                echo "Configuring AWS credentials..."
+                sh "aws configure set default.region ${env.AWS_DEFAULT_REGION}"
+                
+                echo "Authenticating with ECR..."
+                sh """
+                  aws ecr get-login-password --region ${env.AWS_DEFAULT_REGION} | \\
+                  docker login --username AWS --password-stdin 035592488042.dkr.ecr.us-west-2.amazonaws.com
+                """
+                
+                echo "✓ ECR authentication successful"
+                
+                // Extract repository name and tag from image
+                // Format: 035592488042.dkr.ecr.us-west-2.amazonaws.com/service_images/kn-auto-annotator:stage-16
+                def imageParts = params.DOCKER_IMAGE.tokenize('/')
+                def lastPart = imageParts[-1]  // kn-auto-annotator:stage-16
+                def repoAndTag = lastPart.tokenize(':')
+                def repoName = repoAndTag[0]  // kn-auto-annotator
+                def imageTag = repoAndTag.size() > 1 ? repoAndTag[1] : 'latest'  // stage-16
+                
+                // Build full repository path without the tag
+                def repository = imageParts[1..-2].join('/') + '/' + repoName  // service_images/kn-auto-annotator
+                
+                echo "Checking image status in ECR..."
+                echo "  Repository: ${repository}"
+                echo "  Tag: ${imageTag}"
+                
+                // Check if image is archived (in Glacier)
+                def archiveCheck = sh(
+                  script: """
+                    aws ecr describe-images \\
+                      --repository-name ${repository} \\
+                      --image-ids imageTag=${imageTag} \\
+                      --region us-west-2 \\
+                      --query 'imageDetails[0].imageManifestMediaType' \\
+                      --output text 2>&1 || echo 'ERROR'
+                  """,
+                  returnStdout: true
+                ).trim()
+                
+                if (archiveCheck.contains('ERROR') || archiveCheck.contains('ImageNotFoundException')) {
+                  error("""
+❌ Image not found in ECR: ${params.DOCKER_IMAGE}
+
+The image tag '${imageTag}' does not exist in repository '${repository}'.
+
+Action: Verify the image tag is correct.
+""")
+                }
+                
+                // Check if image is archived
+                def lifecycleCheck = sh(
+                  script: """
+                    aws ecr describe-images \\
+                      --repository-name ${repository} \\
+                      --image-ids imageTag=${imageTag} \\
+                      --region us-west-2 \\
+                      --output json 2>&1
+                  """,
+                  returnStdout: true
+                ).trim()
+                
+                if (lifecycleCheck.contains('"imageScanStatus"') && 
+                    lifecycleCheck.contains('SCAN_ELIGIBILITY_EXPIRED')) {
                   echo """
-╔════════════════════════════════════════════════════════════════╗
-║              DOCKER BUILD & SCAN COMPLETED                    ║
-╠════════════════════════════════════════════════════════════════╣
-║  Image:        ${env.PROJECT_DOCKER_IMAGE.take(48).padRight(48)}║
-║  Environment:  ${env.ENVIRONMENT.padRight(48)}║
-║  Orca Project: ${env.ORCA_PROJECT.padRight(48)}║
-║  Scan Status:  ${env.ORCA_SCAN_SUCCESS.padRight(48)}║
-╚════════════════════════════════════════════════════════════════╝
+⚠️  WARNING: Image may be archived or scan-ineligible
+Repository: ${repository}
+Tag: ${imageTag}
+
+This might cause scan failures. Consider:
+  1. Pushing the image again to make it active
+  2. Using a more recent image tag
 """
                 }
-              }
-            }
-          }
-        }
-      }
-      stage('Deploy - kubectl') {
-        when {
-          beforeAgent true
-          environment name: 'CHANGE_ID', value: ''
-          expression {
-            // Deploy to kubectl for dev, staging, qat (not production)
-            return env.ENVIRONMENT in ['development', 'staging', 'qat']
-          }
-        }
-        environment {
-          PATH = "$PATH:/usr/local/bin"
-        }
-        steps {
-          container('go') {
-            dir('./source') {
-              script {
-                withCredentials([
-                [$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AWS_Credentials', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
-              ]){
-	                env.AWS_DEFAULT_REGION = 'us-west-2'
-	                sh "aws configure set default.region ${env.AWS_DEFAULT_REGION}"
-		              configFileProvider([configFile(fileId: env.KUBECONFIG, targetLocation: "./${env.KUBECONFIG}")]) {
-                    timeout(time: 10, unit: 'MINUTES') {
-                      def k8s_manifest_json = readFile(file: "${env.K8S_MANIFEST_JSON}")
-                      def k8s_manifest_rendered = renderTemplate(k8s_manifest_json, ["namespace": "${env.EKS_DEPLOYMENT_NAMESPACE}", "ssl_arn": "${env.AWS_SSL_ARN}"])
-                      def k8_manifest_map = parseJsonToMap(k8s_manifest_rendered)
-                      if ((!k8_manifest_map.containsKey('skip') || k8_manifest_map.skip != "true") && fileExists("${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml")) {
-                        echo "reading kubernetes file of the service"
-			                  def k8s_manifest_template = readFile("${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml").toString()
-                        k8s_manifest_rendered = renderTemplate(k8s_manifest_template, k8_manifest_map)
-                        sh "cat > ${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml <<EOL\n${k8s_manifest_rendered}\nEOL"
-                        if (env.PROJECT_DOCKER_IMAGE?.trim()) {
-                          sh "sed -i \'s|image.*:.*035592488042.*|image: ${env.PROJECT_DOCKER_IMAGE}|\' ${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                        }
-                        echo "Kubernetes manifest file"
-                        sh "cat kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                        echo "Deploying to Kubernetes Cluster - ${env.ENVIRONMENT}"
-                        sh "kubectl --kubeconfig=./${env.KUBECONFIG} apply -f kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                        push_files_to_s3("${env.PROJECT_NAME}.yaml", "${env.ENVIRONMENT}")
-                      } else if (!k8_manifest_map.containsKey('skip') || k8_manifest_map.skip != "true") {
-                        currentBuild.result = 'ABORTED'
-                        error("ABORTED -> Stopping early…. No Project K8s manifests found [ kubernetesfiles/${env.PROJECT_NAME}.yaml ]")
-                      }
-                    }
-                  }
+                
+                // Verify Docker can access the manifest
+                echo "Verifying Docker can access image..."
+                def manifestCheck = sh(
+                  script: "docker manifest inspect ${params.DOCKER_IMAGE} > /dev/null 2>&1 && echo 'SUCCESS' || echo 'FAILED'",
+                  returnStdout: true
+                ).trim()
+                
+                if (manifestCheck == 'FAILED') {
+                  error("""
+❌ Docker cannot access image: ${params.DOCKER_IMAGE}
+
+Possible causes:
+  1. Image is in ARCHIVED state (moved to Glacier storage)
+  2. Image layers have been deleted
+  3. ECR authentication failed (though login succeeded)
+  
+To check archive status:
+  aws ecr describe-images --repository-name ${repository} --image-ids imageTag=${imageTag} --region us-west-2
+
+To restore archived image:
+  1. The image must be restored from Glacier (can take hours)
+  2. Or use a newer, non-archived image tag
+""")
                 }
-              }
-            }
-          }
-        }
-      }
-      stage('Deploy - spinnaker') {
-        when {
-          beforeAgent true
-          environment name: 'CHANGE_ID', value: ''
-          expression {
-            // Deploy to spinnaker for production
-            return env.ENVIRONMENT == 'production'
-          }
-        }
-        environment {
-          PATH = "$PATH:/usr/local/bin"
-        }
-        steps {
-          container('go') {  
-            dir('./source') {
-              script {
-		                  // Additing common spinnaker config file
-                configFileProvider([configFile(fileId: "spinnaker_template", variable: 'file')]) {
-                  echo "Moving Spinnaker config to ${env.MANIFEST_FILE_NAME}.json"
-                  sh "mv ${file} ${env.MANIFEST_FILE_NAME}.json"
-                }
-                withCredentials([
-                [$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AWS_Credentials', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
-              ]) {
-                  timeout(time: 10, unit: 'MINUTES') {
-		                sh "whoami"
-		                sh "ls /home/jenkins"	
-                    def k8s_manifest_json = readFile(file: "${env.K8S_MANIFEST_JSON}")
-                    def k8s_manifest_rendered = renderTemplate(k8s_manifest_json, ["namespace": "${env.EKS_DEPLOYMENT_NAMESPACE}", "ssl_arn": "${env.AWS_SSL_ARN}"])
-                    def k8_manifest_map = parseJsonToMap(k8s_manifest_rendered)
-                    if ((!k8_manifest_map.containsKey('skip') || k8_manifest_map.skip != "true") && fileExists("${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml")) {
-                      def k8s_manifest_template = readFile("${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml").toString()
-                      k8s_manifest_rendered = renderTemplate(k8s_manifest_template, k8_manifest_map)
-                      sh "cat > ${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml <<EOL\n${k8s_manifest_rendered}\nEOL"
-                      if (env.PROJECT_DOCKER_IMAGE?.trim()) {
-                        sh "sed -i \'s|image.*:.*035592488042.*|image: ${env.PROJECT_DOCKER_IMAGE}|\' ${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                      }
-                      push_files_to_s3("${env.PROJECT_NAME}.yaml", "${env.ENVIRONMENT}")
-                      sh "sed -i \'s|namespace.*:.*${env.EKS_DEPLOYMENT_NAMESPACE}.*|namespace: ${env.SPIN_PROMOTE_TO_ENV_EKS_NAMESPACE}|\' ${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                      sh "sed -i \'s|service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-cert.*:.*${env.AWS_SSL_ARN}.*|service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-cert: ${env.SPIN_PROMOTE_AWS_SSL_ARN}|\' ${WORKSPACE}/source/kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                      echo "Kubernetes manifest file"
-                      sh "cat kubernetesfiles/${env.PROJECT_NAME}.yaml"
-                      echo "Uploading Manifest files to S3"
-                      push_files_to_s3("${env.PROJECT_NAME}.yaml", "${env.SPIN_PROMOTE_TO_ENV_NAME}")
-                      echo "Triggering Spinnaker Deployment"
-                      if (params.DeployTarget && !env.PROJECT_NAME.startsWith("tg-")) {
-                        echo "Target deployment: updating PROJECT_NAME to tg-${env.PROJECT_NAME}"
-                        env.PROJECT_NAME = "tg-${env.PROJECT_NAME}"
-                      }
-                      if (fileExists("${WORKSPACE}/source/${env.PROJECT_NAME}.json")) {
-                        def output = ''
-                        spinnaker "render_pipeline"
-                        output = spinnaker "check_application_exists"
-                        if (output == "NOT FOUND") {
-                          echo " !! NO EXISTING SPINNAKER APPLICATION FOUND !!"
-                          echo "<< CREATING NEW SPINNAKER APPLICATION >>"
-                          output = spinnaker "create_application"
-                          if (output == "SUCCESS") {
-                            echo "@@ SUCCESSFULLY CREATED NEW APPLICATION @@"
-                          } else {
-                            currentBuild.result = 'ABORTED'
-                            error("ABORTED -> Stopping early…. New Spinnaker App Creation Failed !! <${output}>")
-                          }
-                        }
-                        echo "<< CREATING/UPDATING SPINNAKER PIPELINE >>"
-                        output = spinnaker "save_pipeline"
-                        if (output == "SUCCESS") {
-                          echo "@@ SUCCESSFULLY UPDATED PIPELINE @@"
-                        } else {
-                          currentBuild.result = 'ABORTED'
-                          error("ABORTED -> Stopping early…. Spinnaker App Pipeline Creation/Updation Failed !! <${output}>")
-                        }
-                        echo "<< TRIGGERING SPINNAKER PIPELINE EXECUTION >>"
-                        output = spinnaker "execute_pipeline"
-                        if (output == "SUCCESS") {
-                          echo "@@ SUCCESSFULLY EXECUTED PIPELINE @@"
-                        } else {
-                          currentBuild.result = 'ABORTED'
-                          error("ABORTED -> Stopping early…. Spinnaker App Pipeline Execution Failed !! <${output}>")
-                        }
-                      } else {
-                        currentBuild.result = 'ABORTED'
-                        error("ABORTED -> Stopping early…. No Project Spinnaker Json found [ ${env.PROJECT_NAME}.json ]")
-                      }
-                    } else if (!k8_manifest_map.containsKey('skip') || k8_manifest_map.skip != "true") {
-                      currentBuild.result = 'ABORTED'
-                      error("ABORTED -> Stopping early…. No Project K8s manifests found [ kubernetesfiles/${env.PROJECT_NAME}.yaml ]")
-                    }
-                  }
-                }
+                
+                echo "✓ Image is accessible and ready for scanning"
+                
+                // Execute Orca scan
+                def scanResults = executeOrcaScan(
+                  params.DOCKER_IMAGE,
+                  'staging',
+                  env.ORCA_API_TOKEN
+                )
+                
+                // Store results in environment variables
+                env.ORCA_SCAN_SUCCESS = scanResults.success.toString()
+                env.ORCA_SCAN_CRITICAL = scanResults.criticalCount.toString()
+                env.ORCA_SCAN_HIGH = scanResults.highCount.toString()
+                env.ORCA_SCAN_MEDIUM = scanResults.mediumCount.toString()
+                env.ORCA_SCAN_LOW = scanResults.lowCount.toString()
+                env.ORCA_SCAN_INFO = scanResults.informationalCount.toString()
+                env.ORCA_SCAN_TOTAL = scanResults.totalVulnerabilities.toString()
+                env.ORCA_PROJECT = scanResults.project
+                env.ORCA_SCAN_ID = scanResults.scanId
+                env.ORCA_SCAN_URL = scanResults.scanUrl
+                
+                echo """
+╔════════════════════════════════════════════════════════════════╗
+║              ORCA SCAN COMPLETED                              ║
+╠════════════════════════════════════════════════════════════════╣
+║  Status:       ${env.ORCA_SCAN_SUCCESS.padRight(48)}║
+║  Project:      ${env.ORCA_PROJECT.padRight(48)}║
+║  Scan ID:      ${env.ORCA_SCAN_ID.take(48).padRight(48)}║
+╠════════════════════════════════════════════════════════════════╣
+║  Critical:     ${env.ORCA_SCAN_CRITICAL.padRight(48)}║
+║  High:         ${env.ORCA_SCAN_HIGH.padRight(48)}║
+║  Medium:       ${env.ORCA_SCAN_MEDIUM.padRight(48)}║
+║  Low:          ${env.ORCA_SCAN_LOW.padRight(48)}║
+║  Info:         ${env.ORCA_SCAN_INFO.padRight(48)}║
+║  Total:        ${env.ORCA_SCAN_TOTAL.padRight(48)}║
+╠════════════════════════════════════════════════════════════════╣
+║  Dashboard:    ${env.ORCA_SCAN_URL.take(48).padRight(48)}║
+╚════════════════════════════════════════════════════════════════╝
+"""
               }
             }
           }
         }
       }
     }
+    
     post {
       always {
-        script{
-          env.CHANGED_LOG = getChangeLogMsgs(currentBuild)
+        script {
           def result = "${currentBuild.currentResult}"
-          
-          // Add environment info to notification
           def buildSummary = """
-Build #${env.BUILD_NUMBER} - ${result}
-Environment: ${env.ENVIRONMENT}
-Branch: ${env.BRANCH_NAME}
-Orca Scan: ${env.ORCA_SCAN_SUCCESS ?: 'N/A'}
+╔════════════════════════════════════════════════════════════════╗
+║              BUILD SUMMARY                                    ║
+╠════════════════════════════════════════════════════════════════╣
+║  Build:        #${env.BUILD_NUMBER} - ${result.padRight(39)}║
+║  Image:        ${params.DOCKER_IMAGE.take(48).padRight(48)}║
+║  Scan Status:  ${env.ORCA_SCAN_SUCCESS ?: 'NOT_RUN'.padRight(48)}║
 """
-          echo buildSummary
           
-          teamsNotifier {
-            buildResult = result
+          if (env.ORCA_SCAN_SUCCESS == 'true') {
+            buildSummary += """║  Vulnerabilities: Critical: ${env.ORCA_SCAN_CRITICAL}, High: ${env.ORCA_SCAN_HIGH}, Medium: ${env.ORCA_SCAN_MEDIUM}${' '.padRight(13)}║
+║  Dashboard:    ${env.ORCA_SCAN_URL.take(48).padRight(48)}║
+"""
           }
+          
+          buildSummary += """╚════════════════════════════════════════════════════════════════╝"""
+          
+          echo buildSummary
         }
       }
       cleanup {
@@ -581,246 +317,19 @@ Orca Scan: ${env.ORCA_SCAN_SUCCESS ?: 'N/A'}
 }
 
 // ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-def getChangeLogMsgs(currentBuild) {
-  passedBuilds = []
-  lastSuccessfulBuild(passedBuilds, currentBuild)
-  return getChangeLog(passedBuilds)
-}
-def lastSuccessfulBuild(passedBuilds, build) {
-  if ((build != null) && (build.result != 'SUCCESS')) {
-    passedBuilds.add(build)
-    lastSuccessfulBuild(passedBuilds, build.getPreviousBuild())
-  }
-}
-def getChangeLog(passedBuilds) {
-  def log = ""
-  for (int x = 0; x < passedBuilds.size(); x++) {
-    def currentBuild = passedBuilds[x];
-    def changeLogSets = currentBuild.rawBuild.changeSets
-    for (int i = 0; i < changeLogSets.size(); i++) {
-      def entries = changeLogSets[i].items
-      for (int j = 0; j < entries.length; j++) {
-        def entry = entries[j]
-        log += "* ${entry.msg} by ${entry.author} \n"
-      }
-    }
-  }
-  if (!log) {
-    log = "* No new changes"
-  }
-  return log;
-}
-def push_files_to_s3(file_name, environment) {
-withAWS(region:'us-west-2', credentials:'AWS_Credentials') {	
-  s3Upload acl: 'Private', bucket: 'jenkins-kubernetes-deployments', cacheControl: '', file: "${file_name}", metadatas: [''], path: "${environment}/", sseAlgorithm: 'AES256', workingDir: 'kubernetesfiles'
-       }
-}
-def pull_files_from_s3() {
-	withAWS(region:'us-west-2', credentials:'AWS_Credentials') {
-  s3Download bucket: 'jenkins-kubernetes-deployments', file: "${env.KX_ENVIRONMENT_CONFIGURATION_JENKINS_LOAD_PATH}", path: "release/${KX_ENVIRONMENT_CONFIGURATION_FILE}", force: true
-	}
-}
-def define_environment(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    return "${branch_environments[env.BRANCH_NAME]['NAME']}"
-  } else {
-    return "${branch_environments[other_branch_environment]['NAME']}"
-  }
-}
-def define_next_promote_environment(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    return "${branch_environments[branch_environments[env.BRANCH_NAME]['SPIN_PROMOTE_TO_ENV']]['NAME']}"
-  } else {
-    return "${branch_environments[branch_environments[other_branch_environment]['SPIN_PROMOTE_TO_ENV']]['NAME']}"
-  }
-}
-def define_next_promote_aws_ssl_arn(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    return "${branch_environments[branch_environments[env.BRANCH_NAME]['SPIN_PROMOTE_TO_ENV']]['SSL_ARN']}"
-  } else {
-    return "${branch_environments[branch_environments[other_branch_environment]['SPIN_PROMOTE_TO_ENV']]['SSL_ARN']}"
-  }
-}
-def define_next_promote_environment_eks_namespace(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    return "${branch_environments[branch_environments[env.BRANCH_NAME]['SPIN_PROMOTE_TO_ENV']]['EKS_NAMESPACE']}"
-  } else {
-    return "${branch_environments[branch_environments[other_branch_environment]['SPIN_PROMOTE_TO_ENV']]['EKS_NAMESPACE']}"
-  }
-}
-def binding_environment(environment) {
-  if (!fileExists("${KX_ENVIRONMENT_CONFIGURATION_JENKINS_LOAD_PATH}")) {
-    pull_files_from_s3();
-    if (!fileExists("${KX_ENVIRONMENT_CONFIGURATION_JENKINS_LOAD_PATH}")) {
-      currentBuild.result = 'ABORTED'
-      env.CHANGED_LOG = "## KX JENKINS ENVIRONMENT FILE MISSING ##"
-      error("ABORTED -> Stopping early…. Environment file not found [ ${KX_ENVIRONMENT_CONFIGURATION_FILE} ]")
-    }
-  }
-  echo "Environment File Detected : ${KX_ENVIRONMENT_CONFIGURATION_FILE}"
-  load "${KX_ENVIRONMENT_CONFIGURATION_JENKINS_LOAD_PATH}"
-  return env."${environment.toUpperCase()}"
-}
-def define_docker_build_image_tag(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    return "${branch_environments[env.BRANCH_NAME]['DOCKER_PREFIX_UNIQUEID']}${env.BUILD_NUMBER}"
-  } else {
-    return "${branch_environments[other_branch_environment]['DOCKER_PREFIX_UNIQUEID']}${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
-  }
-}
-def define_eks_deployment_namespace(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    if (branch_environments[env.BRANCH_NAME]['SHARED_EKS_NAMESPACE'] && branch_environments[env.BRANCH_NAME]['SHARED_EKS_NAMESPACE'] != 'NA') {
-      return "${branch_environments[env.BRANCH_NAME]['SHARED_EKS_NAMESPACE']}"
-    }
-    return "${branch_environments[env.BRANCH_NAME]['EKS_NAMESPACE']}"
-  } else {
-    if (branch_environments[other_branch_environment]['SHARED_EKS_NAMESPACE'] && branch_environments[other_branch_environment]['SHARED_EKS_NAMESPACE'] != 'NA') {
-      return "${branch_environments[env.BRANCH_NAME]['SHARED_EKS_NAMESPACE']}"
-    }
-    return "${branch_environments[other_branch_environment]['EKS_NAMESPACE']}"
-  }
-}
-def define_aws_ssl_arn(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    return "${branch_environments[env.BRANCH_NAME]['SSL_ARN']}"
-  } else {
-    return "${branch_environments[other_branch_environment]['SSL_ARN']}"
-  }
-}
-def define_kubeconfig(branch_environments, other_branch_environment) {
-  if (branch_environments.containsKey(env.BRANCH_NAME)) {
-    return "${branch_environments[env.BRANCH_NAME]['EKS_KUBECONFIG']}"
-  } else {
-    return "${branch_environments[other_branch_environment]['EKS_KUBECONFIG']}"
-  }
-}
-def define_eks_deployment_namespace_toggle(environments_info, environment_binding) {
-  echo "TOGGLING EKS_DEPLOYMENT_NAMESPACE FOR ${environment_binding} --> ${environments_info[environment_binding]['EKS_NAMESPACE']}"
-  return "${environments_info[environment_binding]['EKS_NAMESPACE']}"
-}
-
-def define_kubeconfig_toggle(environments_info, environment_binding) {
-  echo "TOGGLING KUBECONFIG FOR ${environment_binding} --> ${environments_info[environment_binding]['EKS_KUBECONFIG']}"
-  return "${environments_info[environment_binding]['EKS_KUBECONFIG']}"
-}
-
-def definecheckout_to() {
-    def branchName = "${env.BRANCH_NAME}"
-    if (branchName == "master") {
-        return 'staging'
-    }
-    else {
-        return 'development'
-    }
-}
-
-// ============================================================================
-// ENVIRONMENT OVERRIDE HELPER FUNCTIONS
-// ============================================================================
-
-/**
- * Maps environment name to corresponding branch name
- */
-def mapEnvironmentToBranch(String environment) {
-    switch(environment) {
-        case 'production':
-            return 'master'
-        case 'staging':
-            return 'staging'
-        case 'qat':
-            return 'qat'
-        case 'development':
-            return 'development'
-        default:
-            return 'development'
-    }
-}
-
-/**
- * Define Docker image tag based on environment override
- */
-def define_docker_build_image_tag_for_env(String environment) {
-    def prefix = ''
-    switch(environment) {
-        case 'production':
-            prefix = 'prod-'
-            break
-        case 'staging':
-            prefix = 'stage-'
-            break
-        case 'qat':
-            prefix = 'qat-'
-            break
-        default:
-            prefix = 'dev-'
-    }
-    return "${prefix}${env.BUILD_NUMBER}"
-}
-
-/**
- * Define AWS SSL ARN based on environment override
- */
-def define_aws_ssl_arn_for_env(String environment, Map branch_environments) {
-    def targetBranch = mapEnvironmentToBranch(environment)
-    if (branch_environments.containsKey(targetBranch)) {
-        return "${branch_environments[targetBranch]['SSL_ARN']}"
-    }
-    return "${branch_environments['development']['SSL_ARN']}"
-}
-
-/**
- * Define EKS namespace based on environment override
- */
-def define_eks_deployment_namespace_for_env(String environment, Map branch_environments) {
-    def targetBranch = mapEnvironmentToBranch(environment)
-    if (branch_environments.containsKey(targetBranch)) {
-        return "${branch_environments[targetBranch]['EKS_NAMESPACE']}"
-    }
-    return "${branch_environments['development']['EKS_NAMESPACE']}"
-}
-
-/**
- * Define kubeconfig based on environment override
- */
-def define_kubeconfig_for_env(String environment, Map branch_environments) {
-    def targetBranch = mapEnvironmentToBranch(environment)
-    if (branch_environments.containsKey(targetBranch)) {
-        return "${branch_environments[targetBranch]['EKS_KUBECONFIG']}"
-    }
-    return "${branch_environments['development']['EKS_KUBECONFIG']}"
-}
-
-// ============================================================================
 // ORCA SECURITY SCANNING FUNCTIONS
 // ============================================================================
 
 /**
- * Determines the Orca Security project based on environment name
- */
-def getOrcaProjectForEnvironment(String environment) {
-    switch(environment) {
-        case 'production':
-            return 'production'
-        case 'staging':
-            return 'staging'
-        case 'qat':
-            return 'qat'
-        case 'development':
-            return 'development'
-        default:
-            return 'development'
-    }
-}
-
-/**
  * Executes Orca CLI security scan on a Docker image
+ * Sends results to Orca dashboard
+ * 
+ * @param imageName - Full Docker image name with tag
+ * @param orcaProject - Orca project key
+ * @param orcaToken - Orca API token
+ * @return Map containing scan results
  */
-def executeOrcaScan(String imageName, String environment, String orcaToken) {
-    def orcaProject = getOrcaProjectForEnvironment(environment)
+def executeOrcaScan(String imageName, String orcaProject, String orcaToken) {
     def scanResult = [
         success: false, 
         project: orcaProject, 
@@ -828,78 +337,215 @@ def executeOrcaScan(String imageName, String environment, String orcaToken) {
         highCount: 0, 
         mediumCount: 0,
         lowCount: 0,
-        message: ''
+        informationalCount: 0,
+        totalVulnerabilities: 0,
+        message: '',
+        scanId: '',
+        scanUrl: ''
     ]
     
     try {
         echo """
 ╔════════════════════════════════════════════════════════════════╗
-║              EXECUTING ORCA SECURITY SCAN                     ║
+║              ORCA SECURITY SCAN                               ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Image:        ${imageName.take(48).padRight(48)}║
-║  Environment:  ${environment.padRight(48)}║
-║  Orca Project: ${orcaProject.padRight(48)}║
+║  Project:      ${orcaProject.padRight(48)}║
+║  Registry:     ECR (AWS)                                      ║
 ╚════════════════════════════════════════════════════════════════╝
 """
+        
+        // Verify Orca CLI is available
+        def cliCheck = sh(
+            script: 'which orca-cli || echo "NOT_FOUND"', 
+            returnStdout: true
+        ).trim()
+        
+        if (cliCheck == "NOT_FOUND") {
+            echo "⚠️  Orca CLI not found. Installing..."
+            installOrcaCLI()
+        } else {
+            def version = sh(
+                script: 'orca-cli --version 2>&1 || echo "unknown"', 
+                returnStdout: true
+            ).trim()
+            echo "✓ Orca CLI found: ${version}"
+        }
+        
+        // Clean up previous scan results
+        sh 'rm -f orca-scan-*.json orca-cli.log'
         
         // Execute Orca scan
-        sh """
-            orca-cli image scan \
-                --project-key ${orcaProject} \
-                --api-token ${orcaToken} \
-                --format json \
-                --output orca-scan-results.json \
-                --no-color \
-                ${imageName} || true
+        echo "Executing Orca image scan..."
+        def scanCommand = """
+            orca-cli image scan \\
+                "${imageName}" \\
+                --project-key "${orcaProject}" \\
+                --api-token "${orcaToken}" \\
+                --format json \\
+                --output orca-scan-results.json \\
+                --no-color \\
+                --timeout 900s \\
+                --exit-code 0
         """
         
-        // Check if results file was created
+        def scanExitCode = sh(script: scanCommand, returnStatus: true)
+        
+        echo "Scan execution completed with exit code: ${scanExitCode}"
+        
+        // Parse scan results
         if (fileExists('orca-scan-results.json')) {
-            def results = readJSON file: 'orca-scan-results.json'
+            def resultsFile = readFile('orca-scan-results.json').trim()
             
-            scanResult.success = true
-            scanResult.criticalCount = results.critical_count ?: 0
-            scanResult.highCount = results.high_count ?: 0
-            scanResult.mediumCount = results.medium_count ?: 0
-            scanResult.lowCount = results.low_count ?: 0
-            scanResult.message = "Scan completed successfully"
-            
-            echo """
-╔════════════════════════════════════════════════════════════════╗
-║                    SCAN RESULTS SUMMARY                       ║
-╠════════════════════════════════════════════════════════════════╣
-║  Status:       ${scanResult.message.padRight(48)}║
-║  Critical:     ${scanResult.criticalCount.toString().padRight(48)}║
-║  High:         ${scanResult.highCount.toString().padRight(48)}║
-║  Medium:       ${scanResult.mediumCount.toString().padRight(48)}║
-║  Low:          ${scanResult.lowCount.toString().padRight(48)}║
-╠════════════════════════════════════════════════════════════════╣
-║  Results sent to Orca project: ${orcaProject.padRight(29)}║
-╚════════════════════════════════════════════════════════════════╝
-"""
-            
-            // Archive scan results
-            archiveArtifacts artifacts: 'orca-scan-results.json', allowEmptyArchive: true
-            
-            // Optional: Fail build on critical vulnerabilities
-            if (scanResult.criticalCount > 0) {
-                echo "⚠️  WARNING: ${scanResult.criticalCount} critical vulnerabilities found!"
-                // Uncomment to fail build:
-                // error("Build failed due to ${scanResult.criticalCount} critical vulnerabilities")
+            if (resultsFile.isEmpty()) {
+                echo "⚠️  Warning: Results file is empty"
+                scanResult.message = "Scan completed but results file is empty"
+            } else {
+                echo "Parsing scan results..."
+                
+                try {
+                    def results = readJSON text: resultsFile
+                    
+                    // Parse vulnerability counts from different JSON formats
+                    if (results.details) {
+                        def details = results.details
+                        scanResult.criticalCount = details.num_critical ?: 0
+                        scanResult.highCount = details.num_high ?: 0
+                        scanResult.mediumCount = details.num_medium ?: 0
+                        scanResult.lowCount = details.num_low ?: 0
+                        scanResult.informationalCount = details.num_informational ?: 0
+                    } else if (results.summary) {
+                        def summary = results.summary
+                        scanResult.criticalCount = summary.critical ?: 0
+                        scanResult.highCount = summary.high ?: 0
+                        scanResult.mediumCount = summary.medium ?: 0
+                        scanResult.lowCount = summary.low ?: 0
+                        scanResult.informationalCount = summary.informational ?: 0
+                    } else if (results.vulnerabilities) {
+                        scanResult.criticalCount = results.vulnerabilities.count { it.severity?.toUpperCase() == 'CRITICAL' }
+                        scanResult.highCount = results.vulnerabilities.count { it.severity?.toUpperCase() == 'HIGH' }
+                        scanResult.mediumCount = results.vulnerabilities.count { it.severity?.toUpperCase() == 'MEDIUM' }
+                        scanResult.lowCount = results.vulnerabilities.count { it.severity?.toUpperCase() == 'LOW' }
+                        scanResult.informationalCount = results.vulnerabilities.count { it.severity?.toUpperCase() == 'INFORMATIONAL' }
+                    }
+                    
+                    scanResult.totalVulnerabilities = scanResult.criticalCount + 
+                                                      scanResult.highCount + 
+                                                      scanResult.mediumCount + 
+                                                      scanResult.lowCount + 
+                                                      scanResult.informationalCount
+                    
+                    scanResult.scanId = results.scan_id ?: results.id ?: results.asset_id ?: 'N/A'
+                    
+                    if (scanResult.scanId != 'N/A') {
+                        scanResult.scanUrl = "https://app.orca.security/scans/${scanResult.scanId}"
+                    } else {
+                        scanResult.scanUrl = "https://app.orca.security/image-security"
+                    }
+                    
+                    scanResult.success = true
+                    scanResult.message = "Scan completed successfully"
+                    
+                    echo "✓ Successfully parsed scan results"
+                    
+                } catch (Exception parseEx) {
+                    echo "⚠️  JSON parsing error: ${parseEx.message}"
+                    echo "Raw content (first 500 chars): ${resultsFile.take(500)}"
+                    
+                    scanResult.success = true
+                    scanResult.message = "Scan completed but parsing failed"
+                }
             }
             
+            // Archive results
+            archiveArtifacts artifacts: 'orca-scan-results.json', allowEmptyArchive: true
+            
         } else {
-            scanResult.message = "Scan results file not found"
-            echo "⚠️  Warning: ${scanResult.message}"
+            echo "❌ Error: Results file not created"
+            scanResult.message = "Scan output file not found"
+            
+            def errorLog = sh(
+                script: 'cat orca-cli.log 2>/dev/null || echo "No log"',
+                returnStdout: true
+            ).trim()
+            
+            if (errorLog != "No log") {
+                echo "Error log:\n${errorLog}"
+            }
+        }
+        
+        // Display results
+        echo """
+╔════════════════════════════════════════════════════════════════╗
+║                    SCAN RESULTS                               ║
+╠════════════════════════════════════════════════════════════════╣
+║  Status:       ${scanResult.message.padRight(48)}║
+║  Scan ID:      ${scanResult.scanId.take(48).padRight(48)}║
+╠════════════════════════════════════════════════════════════════╣
+║  🔴 Critical:  ${scanResult.criticalCount.toString().padRight(48)}║
+║  🟠 High:      ${scanResult.highCount.toString().padRight(48)}║
+║  🟡 Medium:    ${scanResult.mediumCount.toString().padRight(48)}║
+║  🟢 Low:       ${scanResult.lowCount.toString().padRight(48)}║
+║  ℹ️  Info:      ${scanResult.informationalCount.toString().padRight(48)}║
+╠════════════════════════════════════════════════════════════════╣
+║  Total:        ${scanResult.totalVulnerabilities.toString().padRight(48)}║
+╠════════════════════════════════════════════════════════════════╣
+║  View in Orca: ${scanResult.scanUrl.take(48).padRight(48)}║
+╚════════════════════════════════════════════════════════════════╝
+"""
+        
+        if (scanResult.criticalCount > 0) {
+            echo """
+⚠️  ═══════════════════════════════════════════════════════════════
+⚠️  WARNING: ${scanResult.criticalCount} CRITICAL vulnerabilities found!
+⚠️  Review in Orca: ${scanResult.scanUrl}
+⚠️  ═══════════════════════════════════════════════════════════════
+"""
+        }
+        
+        if (scanResult.success) {
+            echo "✓ Results sent to Orca: AppSec → Image Security → ${orcaProject}"
         }
         
     } catch (Exception e) {
         scanResult.success = false
-        scanResult.message = "Scan failed: ${e.message}"
-        echo "❌ Error during Orca scan: ${e.message}"
+        scanResult.message = "Scan failed with exception"
+        
+        echo """
+❌ ═══════════════════════════════════════════════════════════════
+❌ ORCA SCAN FAILED: ${e.message}
+❌ 
+❌ Check:
+❌   1. Orca API token is valid
+❌   2. Network connectivity to api.orca.security
+❌   3. Image exists and is not archived: ${imageName}
+❌   4. Project '${orcaProject}' exists in Orca
+❌   5. ECR authentication is working
+❌ ═══════════════════════════════════════════════════════════════
+"""
+        
+        currentBuild.result = 'UNSTABLE'
     }
     
     return scanResult
+}
+
+/**
+ * Install Orca CLI
+ */
+def installOrcaCLI() {
+    echo "Installing Orca CLI..."
+    try {
+        sh '''
+            set -e
+            curl -sfL 'https://get.orca.security/cli' | bash
+            orca-cli --version
+            echo "✓ Orca CLI installed"
+        '''
+    } catch (Exception e) {
+        echo "❌ Failed to install Orca CLI: ${e.message}"
+        throw e
+    }
 }
 
 return this
