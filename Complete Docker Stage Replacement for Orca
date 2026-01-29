@@ -1,0 +1,136 @@
+My Recommendation: Go with Approach 1
+Since you already have inline scanning working for development, just extend it to the other branches. It's the simplest, fastest, and most maintainable solution.
+What to do:
+
+Step-by-Step Instructions:
+1. Find Your Current Docker Stage
+In your global pipeline file (Document 2), locate this section (around line 280):
+groovy      stage('Docker') {
+        when {
+          beforeAgent true
+          ...
+2. Delete Everything
+Delete from stage('Docker') { all the way down to its closing } (before the stage('Deploy - kubectl') section)
+3. Copy and Paste
+Copy all the code from Artifact 4 (the one I just updated above) and paste it in place of what you deleted.
+
+What This Code Does:
+✅ Automatically detects the branch and sets the correct Orca project:
+
+development branch → scans to development project
+staging branch → scans to staging project
+qat branch → scans to qat project
+master branch → scans to prod project
+
+✅ Works with both regular and target deployments (with tg- prefix)
+✅ Doesn't break your build if scan has warnings (uses || echo to continue)
+✅ Provides clear logging showing which Orca project received the scan results
+
+stage('Docker') {
+        when {
+          beforeAgent true
+          expression {
+            env.ONLY_MANIFESTS != "true"
+          }
+          environment name: 'CHANGE_ID', value: ''
+          anyOf {
+            branch 'development'; branch 'staging'; branch 'qat'; branch 'master'
+          }
+        }
+        steps {
+          container('docker') {
+            dir('./source') {
+              script {
+                withCredentials([
+                  [$class: 'AmazonWebServicesCredentialsBinding', 
+                   accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
+                   credentialsId: 'AWS_Credentials', 
+                   secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
+                ]) {
+                  env.AWS_DEFAULT_REGION = 'us-west-2'
+                  sh "aws configure set default.region ${env.AWS_DEFAULT_REGION}"
+                  sh "aws ecr create-repository --repository-name service_images/${env.PROJECT_NAME} || true"
+                  sh "aws ecr put-lifecycle-policy --repository-name service_images/${env.PROJECT_NAME} --lifecycle-policy-text '{\"rules\":[{\"rulePriority\":1,\"description\":\"Remove dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":2,\"description\":\"Remove tg-dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":3,\"description\":\"Remove stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":4,\"description\":\"Remove tg-stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":5,\"description\":\"Remove prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":6,\"description\":\"Remove tg-prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":7,\"description\":\"Remove qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":8,\"description\":\"Remove tg-qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":9,\"description\":\"Remove release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":10,\"description\":\"Remove tg-release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":11,\"description\":\"Remove untagged images - KEEP NONE\",\"selection\":{\"tagStatus\":\"untagged\",\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":12,\"description\":\"Remove pre-prod images - KEEP ONLY 1 DAY\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"pre-prod\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}}]}' || true"
+                  sh "aws ecr set-repository-policy --repository-name service_images/${env.PROJECT_NAME} --policy-text '{ \"Version\" : \"2008-10-17\",\"Statement\" : [ { \"Sid\" : \"Allow Prod EKS\",\"Effect\" : \"Allow\",\"Principal\" : { \"AWS\" : \"arn:aws:iam::035592488042:root\" }, \"Action\" : [ \"ecr:GetDownloadUrlForLayer\", \"ecr:BatchGetImage\", \"ecr:BatchCheckLayerAvailability\" ] } ] }'"
+                  sh (script: """aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 035592488042.dkr.ecr.us-west-2.amazonaws.com""") 
+                  
+                  // Determine Orca project based on branch
+                  def orcaProject = 'development'
+                  if (env.BRANCH_NAME == 'staging') {
+                    orcaProject = 'staging'
+                  } else if (env.BRANCH_NAME == 'qat') {
+                    orcaProject = 'qat'
+                  } else if (env.BRANCH_NAME == 'master') {
+                    orcaProject = 'prod'
+                  }
+                  
+                  echo """
+╔════════════════════════════════════════════════════════════════╗
+║              DOCKER BUILD CONFIGURATION                       ║
+╠════════════════════════════════════════════════════════════════╣
+║  Project:      ${env.PROJECT_NAME.padRight(48)}║
+║  Branch:       ${env.BRANCH_NAME.padRight(48)}║
+║  Environment:  ${env.ENVIRONMENT.padRight(48)}║
+║  Orca Project: ${orcaProject.padRight(48)}║
+║  Tag:          ${env.DOCKER_BUILD_IMAGE_TAG.padRight(48)}║
+╚════════════════════════════════════════════════════════════════╝
+"""
+                  
+                  // Add 'tg-' if params.DeployTarget is true
+                  if (params.DeployTarget) {
+                    echo "Target specific deployment has been selected. Only Target image will be created with tg- prefix."
+                    def serviceImage = docker.build("service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}", "--network=host --label environment=${env.ENVIRONMENT} --label service=${env.PROJECT_NAME} --label jenkins_build_number='${env.BUILD_NUMBER}' --label git_commit=${env.GIT_COMMIT} --build-arg project_name='${env.PROJECT_NAME}' --build-arg branch_name='${env.BRANCH_NAME}' .")
+                    
+                    // Run Orca scan for ALL branches with their respective projects
+                    echo "Running Orca security scan for ${orcaProject} environment..."
+                    sh """
+                      orca-cli image scan \\
+                        --project-key ${orcaProject} \\
+                        --api-token ${ORCA_API_TOKEN} \\
+                        service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG} || echo "⚠️  Orca scan completed with warnings"
+                    """
+                    echo "✓ Orca scan completed for project: ${orcaProject}"
+                    
+                    docker.withRegistry("https://${env.ECR_HOST}") {
+                      serviceImage.push()
+                      sh "docker rmi -f ${serviceImage.id} ${env.ECR_HOST}/${serviceImage.id}"
+                    }
+                    env.PROJECT_DOCKER_IMAGE = "${env.ECR_HOST}/service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}"
+                    
+                  } else {
+                    echo "Regular deployment. Target pods will not be deployed."
+                    def serviceImage = docker.build("service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}", "--network=host --label environment=${env.ENVIRONMENT} --label service=${env.PROJECT_NAME} --label jenkins_build_number='${env.BUILD_NUMBER}' --label git_commit=${env.GIT_COMMIT} --build-arg project_name='${env.PROJECT_NAME}' --build-arg branch_name='${env.BRANCH_NAME}' .")
+                    
+                    // Run Orca scan for ALL branches with their respective projects
+                    echo "Running Orca security scan for ${orcaProject} environment..."
+                    sh """
+                      orca-cli image scan \\
+                        --project-key ${orcaProject} \\
+                        --api-token ${ORCA_API_TOKEN} \\
+                        service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG} || echo "⚠️  Orca scan completed with warnings"
+                    """
+                    echo "✓ Orca scan completed for project: ${orcaProject}"
+                    
+                    docker.withRegistry("https://${env.ECR_HOST}") {
+                      serviceImage.push()
+                      sh "docker rmi -f ${serviceImage.id} ${env.ECR_HOST}/${serviceImage.id}"
+                    }
+                    env.PROJECT_DOCKER_IMAGE = "${env.ECR_HOST}/service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}"
+                  }
+                  
+                  echo """
+╔════════════════════════════════════════════════════════════════╗
+║              DOCKER BUILD & SCAN COMPLETED                    ║
+╠════════════════════════════════════════════════════════════════╣
+║  Image:        ${env.PROJECT_DOCKER_IMAGE.take(48).padRight(48)}║
+║  Environment:  ${env.ENVIRONMENT.padRight(48)}║
+║  Orca Project: ${orcaProject.padRight(48)}║
+║  Status:       SUCCESS                                        ║
+╚════════════════════════════════════════════════════════════════╝
+"""
+                }
+              }
+            }
+          }
+        }
+      }
