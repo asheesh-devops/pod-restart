@@ -1,0 +1,128 @@
+// COMPLETE REPLACEMENT FOR THE DOCKER STAGE IN YOUR PIPELINE
+// Replace the entire Docker stage with this code
+
+      stage('Docker') {
+        when {
+          beforeAgent true
+          expression {
+            env.ONLY_MANIFESTS != "true"
+          }
+          environment name: 'CHANGE_ID', value: ''
+          anyOf {
+            branch 'development'; branch 'staging'; branch 'qat'; branch 'master'
+          }
+        }
+        steps {
+          container('docker') {
+            dir('./source') {
+              script {
+                withCredentials([
+                [$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AWS_Credentials', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
+                ]) {
+		              env.AWS_DEFAULT_REGION = 'us-west-2'
+	                sh "aws configure set default.region ${env.AWS_DEFAULT_REGION}"
+                  sh "aws ecr create-repository --repository-name service_images/${env.PROJECT_NAME} || true"
+                  sh "aws ecr put-lifecycle-policy --repository-name service_images/${env.PROJECT_NAME} --lifecycle-policy-text '{\"rules\":[{\"rulePriority\":1,\"description\":\"Remove dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":2,\"description\":\"Remove tg-dev images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-dev\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":3,\"description\":\"Remove stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":4,\"description\":\"Remove tg-stage images - KEEP LAST 2\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-stage\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":2},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":5,\"description\":\"Remove prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":6,\"description\":\"Remove tg-prod images - KEEP LAST 5\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-prod\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":7,\"description\":\"Remove qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":8,\"description\":\"Remove tg-qat images - KEEP LAST 3\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-qat\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":3},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":9,\"description\":\"Remove release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":10,\"description\":\"Remove tg-release images - KEEP FOR 30 DAYS\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"tg-release\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":30},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":11,\"description\":\"Remove untagged images - KEEP NONE\",\"selection\":{\"tagStatus\":\"untagged\",\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":12,\"description\":\"Remove pre-prod images - KEEP ONLY 1 DAY\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"pre-prod\"],\"countType\":\"sinceImagePushed\",\"countUnit\":\"days\",\"countNumber\":1},\"action\":{\"type\":\"expire\"}}]}' || true"
+                  sh "aws ecr set-repository-policy --repository-name service_images/${env.PROJECT_NAME} --policy-text '{ \"Version\" : \"2008-10-17\",\"Statement\" : [ { \"Sid\" : \"Allow Prod EKS\",\"Effect\" : \"Allow\",\"Principal\" : { \"AWS\" : \"arn:aws:iam::035592488042:root\" }, \"Action\" : [ \"ecr:GetDownloadUrlForLayer\", \"ecr:BatchGetImage\", \"ecr:BatchCheckLayerAvailability\" ] } ] }'"
+                  sh (script: """aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 035592488042.dkr.ecr.us-west-2.amazonaws.com""") 
+                  def props = readProperties file: "${env.PROJECT_PROPERTIES_FILE}"
+                  if(props['pythonBuildArtifactsFromS3']?.trim()){
+                    echo "ARTIFACT :: ${env.BUILD_PYTHON_ARTIFACTS_FROM_S3}"
+                    def (project, file_artifact) = "${env.BUILD_PYTHON_ARTIFACTS_FROM_S3}".tokenize( ':' )
+                    def build_environment = "${env.ENVIRONMENT}"
+                    withAWS(region:'us-west-2', credentials:'AWS_Credentials') { 
+                      env.file_path_save = "./${file_artifact}"
+                      env.file_name = file_artifact
+                      env.environment = build_environment
+                      env.project = project
+                      if (env.BRANCH_NAME == 'staging' || env.BRANCH_NAME == 'development' || env.BRANCH_NAME == 'qat' ){ 
+                	      s3Download bucket: 'jenkins-artifacts-live', file: "${env.file_path_save}", path: "${env.environment}/${env.project}/${env.file_name}", force: true
+		  	              }
+		  	              else {
+                        s3Download bucket: 'jenkins-artifacts-live', file: "${env.file_path_save}", path: "production/${env.project}/${env.file_name}", force: true 
+		  	              }  
+                    }		    
+                    if (file_artifact ==~ /^.+\.zip$/){
+                      echo "UNZIPPING ARTIFACT : ${file_artifact}"
+                      sh "unzip -o ${file_artifact}"
+                    }
+                  }
+                  
+                  // Add 'tg-' if params.DeployTarget is true
+                  if (params.DeployTarget) {
+                      echo "Target specific deployment has been selected. Only Target image will be created with tg- prefix."
+                      def serviceImage = docker.build("service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}", "--network=host --label environment=${env.ENVIRONMENT} --label service=${env.PROJECT_NAME} --label jenkins_build_number='${env.BUILD_NUMBER}' --label git_commit=${env.GIT_COMMIT} --build-arg project_name='${env.PROJECT_NAME}' --build-arg branch_name='${env.BRANCH_NAME}' .")
+                      
+                      // Orca security scan for all environments
+                      if (env.BRANCH_NAME == 'development') {
+                          sh """
+                              orca-cli image scan --project-key klearnow --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      if (env.BRANCH_NAME == 'staging') {
+                          sh """
+                              orca-cli image scan --project-key klearnow_stage --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      if (env.BRANCH_NAME == 'qat') {
+                          sh """
+                              orca-cli image scan --project-key klearnow_qat --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      if (env.BRANCH_NAME == 'master' || env.BRANCH_NAME == 'prodmaster') {
+                          sh """
+                              orca-cli image scan --project-key klearnow_prod --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      
+                      docker.withRegistry("https://${env.ECR_HOST}") {
+                          serviceImage.push()
+                          sh "docker rmi -f ${serviceImage.id} ${env.ECR_HOST}/${serviceImage.id}"
+                      }
+                      env.PROJECT_DOCKER_IMAGE = "${env.ECR_HOST}/service_images/${env.PROJECT_NAME}:tg-${env.DOCKER_BUILD_IMAGE_TAG}"
+                  } else {
+                      echo "Regular deployment. Target pods will not be deployed."
+                      def serviceImage = docker.build("service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}", "--network=host --label environment=${env.ENVIRONMENT} --label service=${env.PROJECT_NAME} --label jenkins_build_number='${env.BUILD_NUMBER}' --label git_commit=${env.GIT_COMMIT} --build-arg project_name='${env.PROJECT_NAME}' --build-arg branch_name='${env.BRANCH_NAME}' .")
+                      
+                      // Orca security scan for all environments
+                      if (env.BRANCH_NAME == 'development') {
+                          sh """
+                              orca-cli image scan --project-key klearnow --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      if (env.BRANCH_NAME == 'staging') {
+                          sh """
+                              orca-cli image scan --project-key klearnow_stage --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      if (env.BRANCH_NAME == 'qat') {
+                          sh """
+                              orca-cli image scan --project-key klearnow_qat --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      if (env.BRANCH_NAME == 'master' || env.BRANCH_NAME == 'prodmaster') {
+                          sh """
+                              orca-cli image scan --project-key klearnow_prod --api-token ${ORCA_API_TOKEN} service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}
+                          """
+                      }
+                      
+                      docker.withRegistry("https://${env.ECR_HOST}") {
+                          serviceImage.push()
+                          sh "docker rmi -f ${serviceImage.id} ${env.ECR_HOST}/${serviceImage.id}"
+                      }
+                      env.PROJECT_DOCKER_IMAGE = "${env.ECR_HOST}/service_images/${env.PROJECT_NAME}:${env.DOCKER_BUILD_IMAGE_TAG}"
+                  }
+	              }
+              }
+            }
+          }
+        }
+        post { 
+          always {
+            container('python') { 
+              //sh 'docker system prune -f'      
+              //sh 'docker rmi $(docker images -q -f dangling=true) || true'
+            }
+          }        
+        }
+      }
