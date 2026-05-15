@@ -1,0 +1,38 @@
+name: CI - Restart Kubernetes Pod
+
+on:
+  workflow_dispatch:
+    inputs:
+      pod_name:
+        description: "Pod name to restart (e.g., my-app-deployment-abc123-xyz45)"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - qat
+          - prod
+      wait_for_ready:
+        description: "Wait for replacement pod to become Ready?"
+        required: false
+        type: boolean
+        default: true
+      wait_timeout:
+        description: "Seconds to wait for replacement pod (default: 60)"
+        required: false
+        type: string
+        default: "60"
+
+jobs:
+  pod-restart:
+    uses: klearnow/github-workflow-pipelines/.github/workflows/k8s-pod-restart.yml@master
+    with:
+      pod_name:      ${{ inputs.pod_name }}
+      namespace:     ${{ inputs.namespace }}
+      wait_for_ready: ${{ inputs.wait_for_ready }}
+      wait_timeout:  ${{ inputs.wait_timeout }}
+    secrets: inherit
