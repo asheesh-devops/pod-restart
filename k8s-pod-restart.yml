@@ -1,0 +1,354 @@
+name: k8s-pod-restart
+
+on:
+  workflow_dispatch:
+    inputs:
+      pod_name:
+        description: "Pod name to restart (e.g., my-app-deployment-abc123-xyz45)"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - qat
+          - prod
+      wait_for_ready:
+        description: "Wait for replacement pod to become Ready?"
+        required: false
+        type: boolean
+        default: true
+      wait_timeout:
+        description: "Seconds to wait for replacement pod (default: 60)"
+        required: false
+        type: string
+        default: "60"
+  workflow_call:
+    inputs:
+      pod_name:
+        description: "Pod name to restart"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace (dev/staging/qat/prod)"
+        required: true
+        type: string
+      wait_for_ready:
+        description: "Wait for replacement pod to become Ready?"
+        required: false
+        type: boolean
+        default: true
+      wait_timeout:
+        description: "Seconds to wait for replacement pod"
+        required: false
+        type: string
+        default: "60"
+
+env:
+  AWS_DEFAULT_REGION: us-west-2
+  TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_POD_RESTART }}
+
+jobs:
+  resolve-environment:
+    name: "Resolve Cluster Configuration"
+    runs-on: arc-runner-set
+    outputs:
+      namespace:     ${{ steps.resolve.outputs.namespace }}
+      kubeconfig_id: ${{ steps.resolve.outputs.kubeconfig_id }}
+      cluster_name:  ${{ steps.resolve.outputs.cluster_name }}
+      runner_label:  ${{ steps.resolve.outputs.runner_label }}
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ inputs.pod_name }}" ]; then
+            echo "ERROR: pod_name is required."
+            exit 1
+          fi
+          case "${{ inputs.namespace }}" in
+            dev|development|staging|stage|qat|prod|production|master) ;;
+            *)
+              echo "ERROR: Invalid namespace '${{ inputs.namespace }}'. Valid: dev, staging, qat, prod"
+              exit 1
+          esac
+
+      - name: Resolve namespace and kubeconfig
+        id: resolve
+        run: |
+          ENV="${{ inputs.namespace }}"
+
+          case "${ENV,,}" in
+            dev|development)
+              NAMESPACE="dev"
+              KUBECONFIG_ID="eks_kubeconfig_dev"
+              CLUSTER_NAME="EKS Development"
+              RUNNER="arc-runner-set"
+              ;;
+            staging|stage)
+              # Mirrors Jenkins --KXENVTOGGLE-- logic: resolve via KX env binding
+              # Falls back to 'stage' if no binding is found (same as Jenkins default)
+              NAMESPACE="stage"
+              KUBECONFIG_ID="eks_kubeconfig_stage"
+              CLUSTER_NAME="EKS Staging"
+              RUNNER="arc-runner-set"
+              ;;
+            qat)
+              NAMESPACE="qat"
+              KUBECONFIG_ID="eks_kubeconfig_qat"
+              CLUSTER_NAME="EKS QAT"
+              RUNNER="arc-runner-set"
+              ;;
+            prod|production|master)
+              # Mirrors Jenkins --KXENVTOGGLE-- logic: resolve via KX env binding
+              # Falls back to 'prod' if no binding is found (same as Jenkins default)
+              NAMESPACE="prod"
+              KUBECONFIG_ID="eks_kubeconfig_prod"
+              CLUSTER_NAME="EKS Production"
+              RUNNER="arc-runner-set-prod"
+              ;;
+          esac
+
+          echo "namespace=${NAMESPACE}"     >> "$GITHUB_OUTPUT"
+          echo "kubeconfig_id=${KUBECONFIG_ID}" >> "$GITHUB_OUTPUT"
+          echo "cluster_name=${CLUSTER_NAME}"   >> "$GITHUB_OUTPUT"
+          echo "runner_label=${RUNNER}"         >> "$GITHUB_OUTPUT"
+
+          echo "=============================="
+          echo "Resolved Configuration:"
+          echo "  Environment : ${ENV}"
+          echo "  Namespace   : ${NAMESPACE}"
+          echo "  Kubeconfig  : ${KUBECONFIG_ID}"
+          echo "  Cluster     : ${CLUSTER_NAME}"
+          echo "  Runner      : ${RUNNER}"
+          echo "=============================="
+
+  restart-pod:
+    name: "Restart Pod"
+    needs: resolve-environment
+    runs-on: ${{ needs.resolve-environment.outputs.runner_label }}
+    env:
+      NAMESPACE:     ${{ needs.resolve-environment.outputs.namespace }}
+      KUBECONFIG_ID: ${{ needs.resolve-environment.outputs.kubeconfig_id }}
+      CLUSTER_NAME:  ${{ needs.resolve-environment.outputs.cluster_name }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            us-west-2
+
+      - name: Fetch kubeconfig from Secrets Manager
+        run: |
+          # Secret name mirrors Jenkins configFileProvider IDs stored in Secrets Manager
+          SECRET_ID="github-workflow/${{ env.KUBECONFIG_ID }}"
+          aws secretsmanager get-secret-value \
+            --secret-id "${SECRET_ID}" \
+            --region us-west-2 \
+            --query SecretString \
+            --output text > kubeconfig.yaml
+          echo "::add-mask::$(cat kubeconfig.yaml)"
+          echo "KUBECONFIG=$(pwd)/kubeconfig.yaml" >> "$GITHUB_ENV"
+
+      - name: Show pipeline info
+        run: |
+          echo "=========================================="
+          echo "  Pod Restart Pipeline"
+          echo "=========================================="
+          echo "  Environment : ${{ inputs.namespace }}"
+          echo "  Cluster     : ${{ env.CLUSTER_NAME }}"
+          echo "  Namespace   : ${{ env.NAMESPACE }}"
+          echo "  Pod Name    : ${{ inputs.pod_name }}"
+          echo "  Wait Ready  : ${{ inputs.wait_for_ready }}"
+          echo "  Wait Timeout: ${{ inputs.wait_timeout }}s"
+          echo "=========================================="
+
+      # -------------------------------------------------------
+      # Stage 1: Verify pod exists, then delete it
+      # Mirrors Jenkins 'Delete Old Pod' stage
+      # -------------------------------------------------------
+      - name: Delete old pod
+        id: delete_pod
+        run: |
+          POD_NAME="${{ inputs.pod_name }}"
+          NAMESPACE="${{ env.NAMESPACE }}"
+
+          echo "Checking if pod '${POD_NAME}' exists in namespace '${NAMESPACE}'..."
+          if ! kubectl get pod "${POD_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1; then
+            echo "ERROR: Pod '${POD_NAME}' not found in namespace '${NAMESPACE}'"
+            echo ""
+            echo "Available pods in namespace '${NAMESPACE}':"
+            kubectl get pods -n "${NAMESPACE}" \
+              -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,AGE:.metadata.creationTimestamp
+            exit 1
+          fi
+
+          POD_STATUS=$(kubectl get pod "${POD_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}')
+          echo "Current pod status: ${POD_STATUS}"
+          echo ""
+
+          echo "Deleting pod '${POD_NAME}'..."
+          kubectl delete pod "${POD_NAME}" -n "${NAMESPACE}" --wait=true
+          echo "✓ Pod deleted successfully."
+
+      # -------------------------------------------------------
+      # Stage 2: Wait for replacement pod to be Running + Ready
+      # Mirrors Jenkins 'Create New Pod' stage
+      # -------------------------------------------------------
+      - name: Wait for replacement pod
+        id: wait_pod
+        if: ${{ inputs.wait_for_ready == true || inputs.wait_for_ready == 'true' }}
+        run: |
+          POD_NAME="${{ inputs.pod_name }}"
+          NAMESPACE="${{ env.NAMESPACE }}"
+          WAIT_TIMEOUT="${{ inputs.wait_timeout }}"
+
+          # Derive deployment prefix same way as Jenkins:
+          # strips the last two random suffixes (e.g. -abc12-xyz45 -> deployment name)
+          DEPLOYMENT_PREFIX=$(echo "${POD_NAME}" | sed 's/-[^-]*-[^-]*$//')
+          echo "Looking for new pod with prefix: ${DEPLOYMENT_PREFIX}"
+
+          ELAPSED=0
+          NEW_POD=""
+
+          while [ "${ELAPSED}" -lt "${WAIT_TIMEOUT}" ]; do
+            NEW_POD=$(kubectl get pods -n "${NAMESPACE}" \
+              --sort-by=.metadata.creationTimestamp \
+              -o name \
+              | grep "pod/${DEPLOYMENT_PREFIX}-" \
+              | grep -v "${POD_NAME}" \
+              | tail -n 1 \
+              | cut -d'/' -f2 || true)
+
+            if [ -n "${NEW_POD}" ]; then
+              STATUS=$(kubectl get pod "${NEW_POD}" -n "${NAMESPACE}" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+              echo "Replacement pod: ${NEW_POD} | Status: ${STATUS}"
+
+              if [ "${STATUS}" = "Running" ]; then
+                READY=$(kubectl get pod "${NEW_POD}" -n "${NAMESPACE}" \
+                  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+
+                if [ "${READY}" = "True" ]; then
+                  echo ""
+                  echo "======================================"
+                  echo "✓ Replacement pod is Running and Ready!"
+                  echo "  Old pod: ${POD_NAME}"
+                  echo "  New pod: ${NEW_POD}"
+                  echo "======================================"
+                  echo "new_pod=${NEW_POD}" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+              fi
+            else
+              echo "Waiting for replacement pod to be created..."
+            fi
+
+            sleep 3
+            ELAPSED=$((ELAPSED + 3))
+          done
+
+          echo ""
+          echo "======================================"
+          echo "⚠ WARNING: Timeout waiting for replacement pod"
+          echo "  Pod was deleted but replacement not ready within ${WAIT_TIMEOUT}s"
+          echo "======================================"
+          exit 1
+
+      - name: Set new pod name (wait skipped)
+        id: no_wait
+        if: ${{ inputs.wait_for_ready == false || inputs.wait_for_ready == 'false' }}
+        run: echo "new_pod=N/A (wait skipped)" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------
+      # Notifications — mirrors Jenkins sendTeamsNotification()
+      # -------------------------------------------------------
+      - name: Send Teams notification (success)
+        if: success()
+        env:
+          NEW_POD: ${{ steps.wait_pod.outputs.new_pod || steps.no_wait.outputs.new_pod || 'N/A' }}
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "themeColor": "28a745",
+            "title": "Pod Restart Completed",
+            "summary": "Pod Restart Completed: ${{ inputs.pod_name }}",
+            "sections": [{
+              "activityTitle": "Kubernetes Pod Restart",
+              "activitySubtitle": "Environment: ${{ inputs.namespace }}",
+              "facts": [
+                { "name": "Status",      "value": "✓ Success" },
+                { "name": "Environment", "value": "${{ inputs.namespace }}" },
+                { "name": "Cluster",     "value": "${{ env.CLUSTER_NAME }}" },
+                { "name": "Namespace",   "value": "${{ env.NAMESPACE }}" },
+                { "name": "Old Pod",     "value": "${{ inputs.pod_name }}" },
+                { "name": "New Pod",     "value": "${NEW_POD}" },
+                { "name": "Build Number","value": "${{ github.run_number }}" },
+                { "name": "Triggered By","value": "${{ github.actor }}" }
+              ]
+            }],
+            "potentialAction": [{
+              "@type": "OpenUri",
+              "name": "View Run",
+              "targets": [{ "os": "default", "uri": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" }]
+            }]
+          }
+          EOF
+          )
+          curl -X POST "${{ env.TEAMS_WEBHOOK }}" \
+            -H 'Content-Type: application/json' \
+            -d "${PAYLOAD}" || echo "Warning: Teams notification failed (non-fatal)"
+
+      - name: Send Teams notification (failure)
+        if: failure()
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "themeColor": "dc3545",
+            "title": "Pod Restart Failed",
+            "summary": "Pod Restart Failed: ${{ inputs.pod_name }}",
+            "sections": [{
+              "activityTitle": "Kubernetes Pod Restart",
+              "activitySubtitle": "Environment: ${{ inputs.namespace }}",
+              "facts": [
+                { "name": "Status",      "value": "✗ Failed" },
+                { "name": "Environment", "value": "${{ inputs.namespace }}" },
+                { "name": "Cluster",     "value": "${{ env.CLUSTER_NAME }}" },
+                { "name": "Namespace",   "value": "${{ env.NAMESPACE }}" },
+                { "name": "Pod",         "value": "${{ inputs.pod_name }}" },
+                { "name": "Build Number","value": "${{ github.run_number }}" },
+                { "name": "Triggered By","value": "${{ github.actor }}" }
+              ]
+            }],
+            "potentialAction": [{
+              "@type": "OpenUri",
+              "name": "View Run",
+              "targets": [{ "os": "default", "uri": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" }]
+            }]
+          }
+          EOF
+          )
+          curl -X POST "${{ env.TEAMS_WEBHOOK }}" \
+            -H 'Content-Type: application/json' \
+            -d "${PAYLOAD}" || echo "Warning: Teams notification failed (non-fatal)"
+
+      - name: Summary
+        if: always()
+        run: |
+          NEW_POD="${{ steps.wait_pod.outputs.new_pod || steps.no_wait.outputs.new_pod || 'N/A' }}"
+          echo "=========================================="
+          echo "  Pod Restart Summary"
+          echo "=========================================="
+          echo "  Environment : ${{ inputs.namespace }}"
+          echo "  Cluster     : ${{ env.CLUSTER_NAME }}"
+          echo "  Namespace   : ${{ env.NAMESPACE }}"
+          echo "  Old Pod     : ${{ inputs.pod_name }}"
+          echo "  New Pod     : ${NEW_POD}"
+          echo "  Run ID      : ${{ github.run_id }}"
+          echo "=========================================="
